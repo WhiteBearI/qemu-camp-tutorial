@@ -6,15 +6,19 @@
 
 ---
 
-> K230 外设建模项目阶段总结（2026 年 7 月 \~ 8 月）。从最简单的 IOMUX 寄存器块起步，走完上游提交流程，再到 DesignWare SSI 控制器的完整建模（标准 PIO / QSPI / IDMA / XIP），最终在 V2/V3 把模型拆成通用控制器 + K230 集成层。
+> K230 外设建模项目阶段总结（2026 年 7 月 \~ 8 月）。
 
-项目从 IOMUX 起步——最简单的寄存器块，但把上游提交流程完整走了一遍（发补丁、被评审、拆补丁、补测试），"拆补丁"这个习惯后来一直用到 SPI。SPI/QSPI 这边，三个控制器恰好是同一个 DesignWare SSI IP，做一次覆盖三个实例；从标准 PIO 一路做到 QSPI + IDMA + XIP，最后 U-Boot 能从 Flash 读到 Linux 并启动起来。中间踩了不少坑，基本都是"没按软件的实际用法来"：要么是模式没实现全，要么是清除语义抄错了。
+这段工作分成两部分。先是 IOMUX：它只是一个引脚配置寄存器块，没有中断、DMA 或数据收发，却足够让我完整走一遍上游流程：发补丁、接收评审、拆分补丁、补测试。做到 SPI 时，这套流程已经不再陌生。
+
+另一部分是 SPI/QSPI。三个控制器恰好使用同一个 DesignWare SSI IP，一套模型可以覆盖三个实例；工作从标准 PIO 延伸到 QSPI、IDMA 和 XIP，最终让 U-Boot 从 Flash 读取 Linux 并启动。
+
+下面记录其中几次改变实现方向的排查，以及它们留下的边界。
 
 ## 1. 项目介绍
 
 ### 1.1 项目开始前：K230 在 QEMU 主线长什么样
 
-K230 是 Canaan（Kendryte）的 AIoT SoC，两个 RISC-V 计算核加一个新一代 KPU（Knowledge Process Unit）智能计算单元。项目开始前，QEMU 主线已经有 `-machine k230` 这台机器，`docs/system/riscv/k230.rst` 里写的 Supported devices 是这样：
+K230 是 Canaan 的 AIoT SoC，包含两个 RISC-V 计算核和一个 KPU。项目开始前，QEMU 主线已经有 `-machine k230` 这台机器，文档的 Supported devices 列表只有以下几项：
 
 ```text
 * 1 c908 cores (little core)
@@ -24,34 +28,34 @@ K230 是 Canaan（Kendryte）的 AIoT SoC，两个 RISC-V 计算核加一个新�
 * 5 UART
 ```
 
-就这五项。机器的地址空间里，其余外设全部是 `create_unimplemented_device()` 占位——有地址窗口，但读写是黑洞。当时 `hw/riscv/k230.c` 里这样的占位有 53 个：从启动链上的 CMU、RMU、IOMUX、BootROM、DDRC，到存储的 SD、SPI、QSPI，到外设的 GPIO、I2C、PWM，再到电源的 PMU、PWR，一个不少。
+其余外设虽然有地址窗口，但仍是 `create_unimplemented_device()` 占位，读写没有实际设备行为。当时 `hw/riscv/k230.c` 中这类占位共有 53 个：启动链上的 CMU、RMU、IOMUX、BootROM、DDRC，存储相关的 SD、SPI、QSPI，外设侧的 GPIO、I2C、PWM，以及 PMU、PWR 等。
 
-启动方式上，机器支持 SDK U-Boot M-mode 启动和 direct Linux boot。有个当时 rst 就写明的坑：SDK Linux 内核用 T-HEAD C9xx 私有 MAEE 页表属性，QEMU 不实现 MAEE，这类内核得用标准 RISC-V PTE 重编才能跑。
+启动方面，机器支持 SDK U-Boot M-mode 启动，也支持 direct Linux boot。
 
-一句话概括入场时的状态：**机器能启动，但基本没有外设可用**。
+平时写 Linux 或 U-Boot 驱动时，我们站在外设使用者的角度：查 databook，确定寄存器含义，写配置、读状态、等中断，直到事务结束。驱动默认这些寄存器、状态位和中断线会按约定工作；出问题时，通常只能向芯片原厂提交 case。
 
-### 1.2 任务：一个母 issue，25 个子 issue
+到了 QEMU 外设建模，视角正好反过来：模型成了 IP 的内部实现。驱动写的每一笔配置、读到的每一个状态、等待的每一次中断，都必须由代码给出符合预期的行为。
 
-训练营在 `gevico/qemu-camp-2026-k230` 仓库里开了 K230 建模母 issue `#1`，下面拆成 25 个子 issue（`#2`\~`#26`），正好对着上面那一堆占位。任务本质很直白：**把这些占位逐个变成有真实行为的设备模型，让 SDK 的 U-Boot/Linux 驱动 probe 不卡死**。
+### 1.2 任务： issue
 
-子 issue 按功能分组大致是：
+训练营仓库里的 K230 issue 正好对应这批占位设备。目标是逐步将它们替换成有实际行为的模型，满足 SDK 中 U-Boot 和 Linux 驱动的最小功能契约。
+
+按功能分组大致是这样：
 
 | 组   | 子 issue                                      | 当时状态         |
 | --- | -------------------------------------------- | ------------ |
 | 基础  | #2 CPU、#6 PLIC、#7 CLINT                      | 已有实现/复用，多为补强 |
-| 启动链 | #3 DDRC、#5 BootROM、#10 CMU、#11 RMU、#12 IOMUX | 占位           |
+| 初始化 | #3 DDRC、#5 BootROM、#10 CMU、#11 RMU、#12 IOMUX | 占位           |
 | 存储  | #13 SD、#14 QSPI、#15 Flash window、#18 SPI     | 占位           |
 | 外设  | #16 GPIO、#17 I2C、#19 Timer、#20 RTC           | 占位           |
 | 电源  | #21 PMU、#22 PWR、#23 HI\_SYS                  | 占位           |
 | 其他  | #24 Mailbox、#25 DMA、#26 GSDMA                | 占位           |
 
-（全 25 个的含金量/难度/环境依赖评价在开发日志里。）当时 #8 UART、#11 RMU 已经有人认领，其余基本是开放的。
+当时 #8 UART、#11 RMU 已经有人认领了，其余基本是开放的。
 
 ### 1.3 我的切入点
 
-我选了这条线：先从 #12 IOMUX 入手——最简单的寄存器块，模型清晰，启动价值也够，适合做第一个认真的 PR；然后顺着启动链做 #18 SPI / #14 QSPI / #15 Flash window / #23 HI\_SYS。
-
-选这条线的理由，第 3 章开头会详细讲，这里先给结论：**启动链有 gap**（镜像靠 host 搬进 RAM，Flash 启动是空的），而 SPI 是启动链绕不开的一环；加上三个 SPI 控制器恰好是同一个 DesignWare SSI IP，做一次能覆盖三个实例。
+我先从 IOMUX 入手。它是最简单、边界最清楚的寄存器块，虽然对启动链的直接价值有限，但适合用来完成一次完整的上游贡献流程。之后再继续处理 SPI、QSPI、HI\_SYS 和 Flash window。
 
 ## 2. IOMUX：最简单的外设，最完整的流程
 
@@ -61,17 +65,15 @@ IOMUX 负责"引脚配置"这一环：某个 pin 选哪个功能、要不要上�
 
 ??? note "为什么外设需要 IOMUX"
 
-```
-真实 SoC 上一个外设要工作，通常不只靠外设自己的寄存器：RMU 解除 reset、CMU 打开 clock、IOMUX 把相关引脚配成对应功能，最后才是外设控制器本身。IOMUX 是启动链和外设 probe 的前置配置之一。
+    真实 SoC 上一个外设要工作，通常不只靠外设自己的寄存器：RMU 解除 reset、CMU 打开 clock、IOMUX 把相关引脚配成对应功能，最后才是外设控制器本身。IOMUX 是启动链和外设 probe 的前置配置之一。
 
-K230 把它单独列成一种外设（多数 SoC 塞在 GPIO 里），64 个 pin 配置寄存器，每个对应一个物理管脚，reset 值按 TRM 一条条填。
-```
+    K230 将它单独列为一种外设，而不少 SoC 会将这类配置放在 GPIO 中。它有 64 个 pin 配置寄存器，每个对应一个物理管脚，reset 值可从 U-Boot 和 TRM 对照得到。
 
-实现是个很简单的 misc 设备（QEMU 里杂项设备都放 `hw/misc/`）：一段 32-bit 寄存器数组 + 读写 + 复位值 + 可写掩码。真实的电气特性很难在 QEMU 上实现，第一版只做寄存器兼容——把 `0x91105000..0x911057ff` 从 `create_unimplemented_device()` 变成可读写、可 reset 的寄存器 bank。
+实现本身不复杂：寄存器数组、读写回调、复位值和可写掩码即可。QEMU 中不模拟电气特性，引脚电平也没有 Guest 可观察的消费者；第一版因此只做寄存器兼容，将 `0x91105000..0x911057ff` 从 `create_unimplemented_device()` 替换为可读写、可复位的寄存器 bank。
 
-### 2.2 谁在用这块寄存器：U-Boot dts 的证据
+### 2.2 U-Boot dts 的证据
 
-一开始担心"这寄存器真有人用吗"，翻了 SDK U-Boot 的 dts，证据很硬。`k230.dtsi` 里声明了节点：
+为确认 IOMUX 的实际使用方式，我检查了 SDK U-Boot 的 DTS。`k230.dtsi` 中声明了节点：
 
 ```dts
 iomux: iomux@91105000 {
@@ -99,11 +101,11 @@ pins: iomux_pins {
 };
 ```
 
-也就是说 U-Boot 的 `pinctrl-single` 驱动会做 32 位读改写，写完希望值能读回来——寄存器保存语义就够了，不需要 pin function 副作用。
+也就是说 U-Boot 的 `pinctrl-single` 驱动会做 32 位读改写，写完希望值能读回来——寄存器保存语义就够了。
 
 ### 2.3 实现前后的对比：从 unimplemented 日志到 U-Boot smoke test
 
-实现前（unimplemented device），U-Boot 一跑，`-d unimp` 日志里刷一堆：
+实现前，U-Boot 一跑，`-d unimp` 日志里刷一堆：
 
 ```text
 unimp: unimplemented device write 0x91105000 (size 4)
@@ -111,13 +113,7 @@ unimp: unimplemented device write 0x91105004 (size 4)
 ...
 ```
 
-??? note "unimplemented device 是什么"
-
-```
-`create_unimplemented_device()` 是 QEMU 给"还没建模的外设"占位用的：在地址空间里开一个窗口，读写一律打日志（读返回 0、写忽略），并标记为未实现访问。好处是 guest 访问不会崩、地址图完整；坏处是如果驱动**读回确认**或**依赖某些位**，行为就不对——而 U-Boot 的 pinctrl-single 驱动恰恰会读改写，所以这块日志正是"guest 真的在碰这块寄存器"的证据。
-```
-
-实现后，起一下 U-Boot 看到 `K230#` 就完事了：
+实现后，启动 U-Boot 并确认出现 `K230#` 提示符：
 
 ```bash
 qemu-system-riscv64 -machine k230 -bios u-boot.bin -nographic
@@ -125,11 +121,9 @@ qemu-system-riscv64 -machine k230 -bios u-boot.bin -nographic
 
 到 `K230#` 后，抓的 log 里没有 iomux 的访问告警，说明 guest 访问到这边，建模生效了。配套的验证有 qtest、WDT 回归和 U-Boot smoke test（起机到 `K230#`）。
 
-套路也简单：写之前先看 unimplemented 日志里 guest 碰哪些地址，写完再起一下 guest 确认没被打扰。
-
 ### 2.4 上游 review：拆补丁 + 位级掩码
 
-RFC v1 发出去，Alistair 和 Chao 都给了反馈。第一次发 patch 就有人认真看，意见还很具体，照着改就行，挺难得的。
+RFC v1 发出后，Alistair 和 Chao 都给了具体反馈。这次评审直接影响了后续 SPI 系列的补丁边界和寄存器掩码处理。
 
 **Alistair Francis**：
 
@@ -146,24 +140,21 @@ bits 13-0   配置字段   可读写
 writable mask = 0x00003fff
 ```
 
-v2 按这两条改完：三个补丁、删显式检查、只建 64 个寄存器、位级掩码、补只读/保留位测试。上游流程的完整闭环——RFC → 评审 → 修改 → 拆分 → qtest → v2——一个不落。
+<br />
 
-!!! note "这个环节沉淀了什么"
+!!! note "这次评审留下的习惯"
 
-```
-- "拆补丁"的习惯——后面 SPI 的补丁拆分就是从这条 feedback 长出来的；
-- "每个寄存器的可写位单独确认，不一把梭"——后面 SPI 的 mask 表一直在用；
-- 上游 review 不是走过场，意见具体到能直接照着改。
-```
+    - "拆补丁"的习惯——后面 SPI 的补丁拆分就是从这条 feedback 长出来的；
+    - "每个寄存器的可写位单独确认，不一把梭"——后面 SPI 的 mask 表一直在用；
 
 ## 3. SPI：标准 PIO
 
 ### 3.0 为什么选这条线
 
-选 SPI/QSPI 有两个原因，一主一次：
+选择 SPI/QSPI 建模主要有两个原因：
 
-1. **启动链 gap**：当时看 K230 的启动方式，镜像基本靠 host 直接搬进 RAM，Flash 启动这条路是空的。而 SPI 恰恰是启动链上很重要的一环——K230 从 SPI NOR Flash 启动，U-Boot 得靠 SPI 把镜像读进内存。补上这个 gap，机器才能真正从 Flash 启动 Linux。
-2. **IP 复用巧合**：原本 SPI 和 QSPI 是两个 issue，翻了 TRM 发现三个 SPI 控制器用的是同一个 Synopsys DesignWare SSI IP——做一次能覆盖三个实例，两个 issue 就合并成一个模型来做了。
+1. **补上启动链的空缺**：当时 K230 的镜像基本由 Host 直接装入 RAM，从存储介质启动的路径为空。K230 支持从 SPI NOR Flash 启动，U-Boot 也需要通过 SPI 将后续镜像读入内存，因此 SPI 建模的目标是补齐这条启动路径。
+2. **一次建模覆盖三个实例**：SPI 和 QSPI 原本是两个独立 issue，但 TRM 显示三个控制器使用同一个 Synopsys DesignWare SSI IP。一套模型可以覆盖三个实例，因此可以合并实现。
 
 三个实例能力不一样，但寄存器布局是同一套：
 
@@ -173,29 +164,13 @@ v2 按这两条改完：三个补丁、删显式检查、只建 64 个寄存器�
 | spi1 | `0x91582000` |        QSPI0 |      5 | 否     |
 | spi2 | `0x91583000` |        QSPI1 |      5 | 否     |
 
-!!! warning "SDK 编号与 SoC 子对象顺序对不上"
+### 3.1 模型骨架是怎么搭出来的
 
-```
-SDK 的逻辑编号（spi0/spi1/spi2）和 QEMU SoC 里的子对象顺序（`dw_ssi[0..2]`）是错位的：SDK 的 spi0 对应 `dw_ssi[2]`，spi1 对应 `dw_ssi[0]`，spi2 对应 `dw_ssi[1]`。这个映射写死在 `k230_ssi_routes[]` 里。
-```
+实现前先完成三项准备：根据 TRM 梳理寄存器组和数据通路，检查 QEMU 现有 SPI 模型的架构，并确认 SSI 总线抽象的使用方式。
 
-### 3.1 从 TRM 里读出来的模型骨架
+第一步是翻 TRM 12.3 章，把寄存器清单理出来：`CTRLR0`、`CTRLR1`、`SSIENR`、`SER`、`BAUDR`、`TXFTLR`/`RXFTLR`（FIFO 阈值）、`TXFLR`/`RXFLR`（FIFO 当前深度，动态变化）、`SR`（状态）、`IMR`/`ISR`/`RISR`（中断屏蔽/状态/原始状态）、`*ICR`（中断清除，读清零）、`DR0..DR35`（数据 FIFO 入口）。先让这些寄存器能读能写、复位值对、mask 对，传输逻辑后面再补。
 
-目标很单纯：把寄存器空间映射到 MemoryRegion 上，能读能写，复位值对，mask 对。寄存器列表从 TRM 12.3 一条条抄：`CTRLR0`、`CTRLR1`、`SSIENR`、`SER`、`BAUDR`、`TXFTLR`/`RXFTLR`、`TXFLR`/`RXFLR`（动态）、`SR`（动态）、`IMR`/`ISR`/`RISR`、`*ICR`（读清除）、`DR0..DR35`。
-
-!!! warning "一个容易被 TRM 忽略的细节：`VERSION` 寄存器"
-
-```
-`VERSION` 复位值 `0x3130332a`，按 ASCII 解出来是字符串 `1.03*`。TRM 自己写着 "Contains the hex representation of the Synopsys component version"——也就是说 **K230 TRM 自己承认这是 Synopsys 的 IP**，不是自研。这个发现后来成了"该不该拆通用模型"的关键证据（见第 6 章）。
-```
-
-??? note "Synopsys databook：有参考，但拿不到公开链接"
-
-```
-其实手上有 Synopsys 的 DWC SSI databook 和 DW APB SSI databook（eetop 上流传的 PDF），做语义核对时一直在用（TX-only、RXO 丢帧、RX-only dummy 重发这些精确语义就是从那对出来的）。但 Synopsys 官方只通过 myDesignWare 注册下发，**没有稳定的公开链接**——所以它只能作为内部一致性核对材料，不能作为上游 reviewer 可访问的引用。上游要证据时，最终还得靠公开的 K230 TRM + Linux 驱动 + Intel Arria 10 TRM（DW APB 家族对照）独立支撑。这也是 V3 时 Chao 要链接、我只能给公开资料三件套的原因。
-```
-
-PIO 数据通路是 `DR` 写入 → TX FIFO → 传输泵 → RX FIFO → `DR` 读出。QEMU 里 SPI 的建模方式是 SSI 总线：
+随后梳理数据通路：写 `DR` 进入 TX FIFO，传输泵将数据发至总线，返回数据进入 RX FIFO，再由读 `DR` 取走：
 
 ```mermaid
 flowchart LR
@@ -216,176 +191,193 @@ flowchart LR
     Bus --> FLASH["m25p80 (SPI NOR)"]
 ```
 
-??? note "QEMU 的 SSI 总线抽象"
-
-```
-QEMU 在 `include/hw/ssi.h` 里定义了 SSI（Synchronous Serial Interface）总线：
+第二步是搞懂 QEMU 的 SSI 总线抽象，这是 SPI 控制器和 Flash 模型之间的接口层。QEMU 在 `include/hw/ssi.h` 里定义了：
 
 - `TYPE_SSI_BUS` 是总线，挂在 master 设备下；
 - `TYPE_SSI_SLAVE` 是从设备接口，m25p80（SPI NOR Flash 模型）就继承它；
-- master 用 `ssi_transfer(SSI_SLAVE(cs), value)` 给某个片选发一帧，slave 在自己的 `transfer` 回调里返回 RX 值。
+- master 调用 `ssi_transfer(SSI_SLAVE(cs), value)` 给选中的片选发一帧，slave 在自己的 `transfer` 回调里返回对应字节。
 
-一次 `ssi_transfer()` 就是一个时钟周期——master 推一个值出去，同时收一个值回来。**事务级抽象，不模拟波形**。这对 SPI NOR 这种只关心字节流的设备完全够用。
-```
+一次 `ssi_transfer()` 对应一个时钟周期，master 推一个字节出去同时收一个字节回来，是**事务级抽象，不模拟 SCLK/CS 波形**，对 SPI NOR 这种只关心字节流的设备完全够用。
 
-FIFO 用 `Fifo32`，容量 256。有个容易绕进去的点：`DR0` 到 `DR35` 这 36 个地址共享同一对 FIFO，读写入口得统一。
+FIFO 用 QEMU 自带的 `Fifo32`，容量 256。这里有个容易踩的坑：`DR0` 到 `DR35` 这 36 个 MMIO 地址共享同一对 TX/RX FIFO，不管读写哪个偏移都要落到同一个 FIFO 入口，不能各自独立。
 
-??? note "参考过的其他 SSI 模型"
+第三步是参考 QEMU 里现有的 SPI 模型学架构。QEMU 树里没有可直接照抄的 DWC APB SSI 模型，主要借鉴「阶段机 + FIFO pump」的写法：
 
-```
-写之前把 QEMU 里现成的 SPI/SSI 模型过了一遍，判断哪些值得借鉴：
+| 参考模型                                        | 借鉴点                                      |
+| ------------------------------------------- | ---------------------------------------- |
+| `sifive_spi.c` / `pl022.c` / `xilinx_spi.c` | 最朴素的逐帧泵：pop TX → ssi\_transfer → push RX |
+| `ibex_spi_host.c`                           | 用剩余帧数控制传输长度的状态机写法                        |
+| `xlnx-versal-ospi.c`                        | 读 Flash 时自动填 0 产生读时钟的思路                  |
+| `xilinx_spips.c`                            | command/address/dummy 多阶段状态机结构           |
+| `designware_i2c.c`                          | Synopsys IP 做通用层拆分的先例                    |
 
-| 模型 | 特点 | 借鉴/不借鉴 |
-|---|---|---|
-| `hw/ssi/sifive_spi.c` / `pl022.c` / `xilinx_spi.c` | 普通逐帧交换：pop TX → ssi_transfer → push RX | 看最朴素的 FIFO pump 长什么样 |
-| `hw/ssi/ibex_spi_host.c` | 用 command length 保存剩余传输数量 | 结构参考 |
-| `hw/ssi/xlnx-versal-ospi.c` | 读 Flash 时向 TX FIFO 填 0 产生读时钟 | 思路参考 |
-| `hw/ssi/xilinx_spips.c` | 保存 command/address/dummy 的阶段状态 | 阶段机结构参考 |
-| `hw/i2c/designware_i2c.c` | Synopsys DW I2C 通用模型，无 SoC wrapper | 后来 V2 拆分通用层的先例 |
+DWC SSI 和普通 SPI 控制器有个关键区别：普通控制器需要驱动自己发 dummy 字节产生读时钟，而 DWC SSI 的 EEPROM\_READ 等模式靠 `CTRLR1.NDF`（Number of Data Frames）让硬件自动走完 dummy 阶段进入数据期。所以模型里需要自己实现 `phase + remaining_frames` 的状态机，不能直接照搬其他控制器的行为。
 
-这些模型不是 K230 寄存器语义的直接模板——普通控制器多数要求驱动自己写 N 个 dummy byte，而 DWC SSI 的 RO/EEPROM_READ 用 NDF 让硬件自动进数据阶段。所以借鉴的是**"阶段机 + FIFO pump"的结构**，而不是复制寄存器行为。当前 QEMU 树里没有可直接照抄的成熟 DWC APB SSI 外设模型，这也是 K230 的 `phase + remaining_frames` 看起来比普通 SPI 模型多一些状态的原因。
+### 3.2 四种 TMOD 模式
 
-IDMA 那边还对照过两条路线：Versal OSPI 的 stream 模型（`stream_push`/`stream_can_push`，表达 backpressure）vs Aspeed SMC 的内部 AddressSpace 模型（控制器自己搬内存）。K230 走的是后者那种简化路线——因为 SDK 驱动死等 DONE，同步够用，异步是过度设计（详见 4.3）。
-```
+`CTRLR0[11:10]` 叫 TMOD（Transfer Mode），决定一次 SPI 事务的方向。TRM 给了四种模式，光看寄存器手册不太容易搞清楚软件实际怎么用，对照 U-Boot 的 `designware_spi.c` 和 Linux 的 `spi-dw-core.c` 才对上号：
 
-### 3.2 四种 TMOD 模式：怎么从 TRM + SDK 交叉确认
+| TMOD | 名称                     | 方向           | RX 帧数怎么决定          | 谁在用                        |
+| ---- | ---------------------- | ------------ | ------------------ | -------------------------- |
+| 0    | TR（Transmit & Receive） | 全双工          | TX FIFO 发多少，RX 回多少 | 通用 SPI 读写，TX/RX 都有数据       |
+| 1    | TO（Transmit Only）      | 只发不收         | 不产生 RX 数据          | 写 Flash（Page Program）、发命令  |
+| 2    | RO（Receive Only）       | 只收不发         | `CTRLR1.NDF + 1`   | 纯数据接收，需一个 dummy 帧启动        |
+| 3    | EEPROM\_READ           | 先发命令/地址，再自动收 | `CTRLR1.NDF + 1`   | **spi-mem 读操作（含 Read ID）** |
 
-这是最值得讲清楚的部分。DW SSI 的 `CTRLR0[11:10]` 叫 TMOD，决定一次事务是"既发又收"还是单向的。TRM 定义了四种：
+四种模式的核心区别在传输泵怎么处理 RX 帧。TR 和 TO 比较直观：TR 逐帧从 TX FIFO pop，调 `ssi_transfer()` 发出去，返回值 push 进 RX FIFO；TO 只发不收，pop 完就结束。
 
-| TMOD | 名称           | 语义                     | 谁在用                     |
-| ---- | ------------ | ---------------------- | ----------------------- |
-| 0    | TR           | 全双工，TX 发多少 RX 回多少      | 裸机/通用驱动                 |
-| 1    | TO           | 只发不收（写 Flash 用）        | U-Boot Page Program     |
-| 2    | RO           | 只收不发，需一个 dummy word 启动 | 纯读                      |
-| 3    | EEPROM\_READ | 先发指令 + 地址，再按 NDF 自动收     | **spi-mem Read-ID 就是它** |
+RO 和 EEPROM\_READ 不一样——它们需要硬件在命令/地址发完后**自动产生接收时钟**，软件不会再往 TX FIFO 里写 dummy 字节。具体来说：
 
-怎么确认的？两条线索交叉：
+- **RO**：写一个 dummy 帧进 TX FIFO 启动传输，之后硬件自动发出 `NDF+1` 个时钟收数据，软件只需要 poll RXFLR 然后读 DR。
+- **EEPROM\_READ**：往 TX FIFO 写命令（和地址，如果有的话），硬件发完命令/地址阶段后自动切到接收阶段，收 `NDF+1` 帧数据。这是 spi-mem 框架读 Flash 时用的标准路径。
 
-1. **TRM 12.3**：寄存器字段定义 + 每种 TMOD 的时序描述；
-2. **SDK 驱动**：U-Boot `designware_spi.c` 和 Linux `spi-dw-core.c` 里，`dw_spi_exec_op()` 对每种操作选什么 TMOD。
+初版只实现了 TR 和 TO，RO 与 EEPROM\_READ 被留到后续。挂上 Flash 启动 U-Boot 后，系统卡在 `spi_nor_read_id()`，RXFLR 始终为 0。
 
-关键结论：四种模式走同一个 `k230_dw_ssi_run_transfer()` 传输泵，区别只在 RX 帧数怎么决定：
-
-- TR/TO：TX FIFO 有多少发多少，RX 跟着回多少（TO 没有 RX）
-- RO/EEPROM\_READ：由 `CTRLR1.NDF+1` 决定接收帧数，先发一个指令/地址帧，然后纯收
-
-!!! bug "不实现 EEPROM\_READ，U-Boot 就卡死"
-
-````
-**现象**：挂上 Flash 跑 U-Boot，卡在 `spi_nor_read_id()`，`RXFLR` 永远为 0。
-
-**机制**：一开始只实现了 TR 和 TO，觉得 RO 和 EEPROM_READ 后面再说。打开 trace 一看：
+寄存器 trace 如下：
 
 ```text
-CTRLR0 = 0x00000c07  -> TMOD[11:10] = 3，EEPROM_READ
-CTRLR1 = 0x00000005  -> NDF + 1 = 6 个接收帧
+CTRLR0 = 0x00000c07  -> TMOD[11:10] = 3 (EEPROM_READ)
+CTRLR1 = 0x00000005  -> NDF = 5，即 NDF+1 = 6 个接收帧
 SSIENR = 0x00000001  -> 控制器已启用
-SER    = 0x00000001  -> CS0 已选择
-RXFLR  = 0x00000000  -> 没有任何接收数据
+SER    = 0x00000001  -> CS0 已选中
+RXFLR  = 0x00000000  -> RX FIFO 永远是空的
 ```
 
-根因是对软件怎么用控制器理解错了。普通全双工驱动是每个待收字节都写一个 dummy：
+U-Boot 的 spi-mem 路径读取 JEDEC ID 时只向 DR 写入一个 `0x9f`（Read ID 命令），随后轮询 RXFLR 等待 6 个字节。Guest 不会继续写入 5 个 dummy 字节；真实硬件会在命令阶段结束后自动产生后续时钟来接收数据。初版模型只在 DR 写入时触发一次 `ssi_transfer()`：发出 `0x9f` 后便停止，后续没有 MMIO 写入触发剩余传输，因此 RXFLR 始终为 0。问题不在 Flash 的 ID 返回，而在控制器没有发出读取 ID 所需的后续时钟。
 
-```text
-写 opcode
-写 address byte 0
-写 address byte 1
-写 address byte 2
-写 dummy x3
-读 RX FIFO
+对照 U-Boot 驱动 `dw_spi_exec_op()` 里的选择逻辑就很清楚了：
+
+```c
+if (read)
+    if (priv->spi_frf == CTRLR0_SPI_FRF_BYTE)
+        priv->tmode = CTRLR0_TMOD_EPROMREAD;   // 标准单线读 -> EEPROM_READ
+    else
+        priv->tmode = CTRLR0_TMOD_RO;          // 双线/四线 -> RO
+else
+    priv->tmode = CTRLR0_TMOD_TO;              // 写操作 -> TO
 ```
 
-只要模型在每次 DR 写入时调一次 `ssi_transfer()`，就能自然得到 RX 数据。
+单线读（包括 Read ID、Read Data、Read SFDP）全部走 EEPROM\_READ，NDF 设为 `data.nbytes - 1`，写完命令+地址+dummy 后调 `poll_transfer()` 轮询 RXFLR 收数据。所以传输泵必须实现 EEPROM\_READ 的两阶段状态机：先把 TX FIFO 里的命令/地址发完，然后自动发 `NDF+1` 帧 0x00 产生时钟，把 RX 数据收回来。RO 同理，只是命令阶段只有一个 dummy 帧。
 
-但 K230 U-Boot 的 spi-mem Read-ID 是另一套序列：
+### 3.3 挂 Flash：num-cs 的 SDK 内部不一致
 
-```text
-CTRLR0.TMOD = EEPROM_READ
-CTRLR1.NDF  = 5
-SSIENR      = 1
-DR          = 0x9f        # 只写命令
-SER         = 1
-poll RXFLR               # 等 6 个字节回来
-```
+Flash 挂接本身只需将 spi0 的 CS0 连接到 m25p80（SPI NOR Flash 模型）。但 SDK 内部对 `num-cs`（片选数量）的描述不一致：U-Boot DTS 与 Linux DTS 的值不同。
 
-Guest 没有再写 6 个 dummy，因为真实硬件会在命令阶段后自动产生接收时钟。模型只在 DR 写入时发一次，最多发出 `0x9f`，之后没有任何 MMIO 写入触发剩余传输，`RXFLR` 永远为 0。
+- U-Boot DTS 里 spi0/spi1/spi2 的 `num-cs` 是 `1/5/5`
+- Linux DTS 里是 `1/1/1`
 
-**不是 Flash 的问题**：问题不是 Flash 不返回 ID，是控制器根本没产生读 ID 所需的后续时钟。
+这不是功能 bug，更像两边 DTS 没有对齐——Linux 侧可能直接用了驱动默认值，没按 SoC 实际片选数量写。当前启动路径是 U-Boot → Linux，以 U-Boot 为准选了 `1/5/5`，Linux 侧靠驱动 probe 时动态探测。模型的 `num-cs` 属性按实际硬件实例能力配，不硬编码某一方 DTS 的值。
 
-**怎么从 SDK/TRM 找到答案的**：`spi_nor_read_id()` 卡住后，先去 TRM 12.3 查 TMOD 编码——`CTRLR0[11:10]=3` 就是 EEPROM_READ，TRM 明确写"命令阶段后自动产生接收时钟，接收帧数由 NDF+1 决定"。再去 SDK U-Boot 的 `designware_spi.c` 里翻 `dw_spi_exec_op()`，发现标准 read 路径压根不写 dummy、只写一个 `0x9f` 命令就 poll RXFLR。两条线索一对：TRM 说硬件会自己收，SDK 说软件只发命令——模型缺的正是"自动收"这半截。
+### 3.4 IRQ：动态水位中断
 
-**修法**：RO/EEPROM_READ 由 `CTRLR1.NDF+1` 决定接收帧数，先发指令/地址帧，然后自动收。
+K230 DW SSI 共有 9 路中断接到 PLIC：TXE（TX FIFO 空）、RXF（RX FIFO 满/达阈值）、RXO（RX 溢出）、TXU（TX 欠载）、RXU（RX 欠载）、MST（多主机冲突）、DONE（传输完成）、AXIE（AXI/IDMA 错误）加一个总清。其实还有ssi ip理论还有不少其他的中断，不过鉴于k230只支持9路，于是我就按9路实现了。
 
-**教训**：实现顺序不能图省事，得跟着软件的实际调用路径走。
-````
-
-### 3.3 挂 Flash：num-cs 的 SDK 内部冲突
-
-挂 Flash 是 `spi-flash` 机器属性，m25p80 挂 CS0。这里踩了个 SDK 内部对不上的坑：
-
-!!! warning "num-cs 在 SDK 内部就对不上"
-
-```
-U-Boot DTS 里 `num-cs` 是 **`1/5/5`**（spi0/spi1/spi2），Linux DTS 里是 **`1/1/1`**。不是功能 bug，更像是两边 DTS 没对齐（Linux 侧可能用了驱动默认值而非 SoC 实际值）。
-
-处理方式：按当前启动软件路径选了 `1/5/5`，但没写成 TRM 唯一结论，上游说明里保留了证据差异。
-
-**教训**：遇到 SDK 内部不一致，记录证据、按用例决策、不替上游下结论。
-```
-
-### 3.4 IRQ：动态水位，不是缓存值
-
-9 路 IRQ 接进 PLIC（TXE、RXF、RXO、TXU、RXU、MST、DONE、AXIE 加总清，IRQ base 三实例连续）。TXE/RXF 一开始是缓存的，后来改成动态水位——从 FIFO 实际数量算，不缓存：
+中断这块返过一次工。TXE 和 RXF 是水位中断：TXE 表示 TX FIFO 里的数据量低于或等于阈值（TFT），可以继续喂数据；RXF 表示 RX FIFO 里的数据量超过阈值（RFT），需要读走。这两个中断**不能用缓存值**——每次中断状态计算时，都必须从 FIFO 实时读取当前深度，和阈值寄存器比较，现算出来：
 
 ```c
 static uint32_t k230_dw_ssi_irq_raw_status(K230DwSsiState *s)
 {
     uint32_t status = s->irq_latched;
+    /* 从 FIFO 实时读深度，不能用 regs[] 里的缓存 */
     uint32_t tx_used = fifo32_num_used(&s->tx_fifo);
     uint32_t rx_used = fifo32_num_used(&s->rx_fifo);
+    /* 阈值寄存器只取 TFT/RFT 字段，其他位是保留的 */
     uint32_t tx_threshold = FIELD_EX32(s->regs[R_TXFTLR], TXFTLR, TFT);
     uint32_t rx_threshold = FIELD_EX32(s->regs[R_RXFTLR], RXFTLR, RFT);
 
     if (tx_used <= tx_threshold) {
-        status |= R_RISR_TXEIR_MASK;
+        status |= R_RISR_TXEIR_MASK;   /* TX FIFO 空水位：可以继续写 */
     }
     if (rx_used > rx_threshold) {
-        status |= R_RISR_RXFIR_MASK;
+        status |= R_RISR_RXFIR_MASK;   /* RX FIFO 满水位：需要读走 */
     }
     return status & K230_DW_SSI_IRQ_VALID_MASK;
 }
 ```
 
-!!! note "为什么不能缓存"
+`s->irq_latched` 存的是事件型中断（RXO 溢出、TXU 欠载等），这些是边沿触发的事件，发生一次就锁存，读 ICR 清除。TXE/RXF 是电平型状态，每次算 RISR 都得现算，跟 FIFO 实际深度走。TXFLR/RXFLR 这两个 MMIO 寄存器也是同样道理——读的时候直接返回 `fifo32_num_used()`，不能从 `regs[]` 数组里返回缓存值。
 
+### 3.5 验证：U-Boot 和 Linux 两侧对照
+
+标准 PIO 的验证是让 U-Boot 从 SPI Flash 读取镜像并启动 Linux。下面按 U-Boot 驱动的行为对照模型响应。
+
+**第一步：U-Boot 初始化 SPI 控制器**
+
+U-Boot 驱动 `designware_spi.c` 里的初始化流程：
+
+```c
+/* U-Boot: dw_spi_set_bus_and_cs() / dw_spi_claim_bus() */
+dw_write(priv, DW_SPI_SSIENR, 0);          /* 先禁用控制器 */
+dw_write(priv, DW_SPI_CTRLR0, cr0);        /* 设帧格式、TMOD、时钟极性等 */
+dw_write(priv, DW_SPI_BAUDR, clk_div);     /* 设波特率分频 */
+dw_write(priv, DW_SPI_TXFTLR, 0);          /* TX 阈值设 0 */
+dw_write(priv, DW_SPI_RXFTLR, fifo_len-1); /* RX 阈值设 FIFO 深度-1 */
+dw_write(priv, DW_SPI_SER, 1 << cs);       /* 片选 */
+dw_write(priv, DW_SSI_SSIENR, 1);          /* 启用控制器 */
 ```
-TXFLR/RXFLR 是 MMIO 动态视图，不能从 `regs[]` 读缓存值代替；TXFTLR/RXFTLR 也必须只取 TFT/RFT 字段。FIFO 满时写入要锁存 TXO 并更新 IRQ。
+
+QEMU 模型这边，每次写 `SSIENR=1` 时会复位内部状态（phase 回到 IDLE，清空 remaining\_frames），写 `SER` 时切换 active\_cs，写 `CTRLR0/BAUDR` 只是存进 regs\[]，传输泵在 DR 写入时才启动。
+
+**第二步：读 JEDEC ID 探测 Flash（spi\_nor\_read\_id）**
+
+这是 EEPROM\_READ 的典型用法。U-Boot 通过 spi-mem 调 `dw_spi_exec_op()`：
+
+```c
+/* U-Boot: dw_spi_exec_op()，读 JEDEC ID（0x9f） */
+priv->tmode = CTRLR0_TMOD_EPROMREAD;       /* EEPROM_READ 模式 */
+dw_write(priv, DW_SPI_CTRLR0, cr0);
+dw_write(priv, DW_SPI_CTRLR1, 6 - 1);      /* NDF = 5，收 6 字节 */
+dw_write(priv, DW_SSI_SSIENR, 1);
+dw_writer(priv, &opcode_9f, 0, 1, ...);    /* 只写 0x9f 一个字节 */
+poll_transfer(priv, NULL, rx_buf, 6);      /* 轮询 RXFLR，读 6 字节 */
 ```
 
-### 3.5 验证：U-Boot + Linux 两侧都跑一遍
+QEMU 模型在 DR 写入时调用传输泵，识别到 TMOD=EEPROM\_READ：
 
-标准 PIO 的验证就是 U-Boot 和 Linux 两侧都跑一遍读写。U-Boot 侧 `sf probe` / `sf read` 把镜像读进内存，bootm 启动 Linux：
+```c
+/* QEMU: k230_dw_ssi_run_transfer() EEPROM_READ 分支 */
+case K230_DW_SSI_TMOD_EEPROM_READ:
+    /* 命令阶段：把 TX FIFO 里的命令/地址发出去 */
+    while (!fifo32_is_empty(&s->tx_fifo)) {
+        uint32_t tx = fifo32_pop(&s->tx_fifo);
+        k230_dw_ssi_send_frame(s, tx);      /* 0x9f -> ssi_transfer() -> m25p80 */
+    }
+    s->phase = K230_DW_SSI_PHASE_EEPROM_DATA;
+    s->remaining_frames = FIELD_EX32(s->regs[R_CTRLR1], CTRLR1, NDF) + 1;
+    /* 数据阶段：自动发 0x00 产生时钟，收 NDF+1 字节 */
+    while (!fifo32_is_full(&s->rx_fifo) && s->remaining_frames > 0) {
+        uint32_t rx = k230_dw_ssi_send_frame(s, 0x00);
+        fifo32_push(&s->rx_fifo, rx);       /* m25p80 返回的 ID 字节进 RX FIFO */
+        s->remaining_frames--;
+    }
+```
+
+m25p80 收到 `0x9f` 后，后续每个时钟沿返回 JEDEC ID 字节（如 `0xef 0x40 0x19` 表示 Winbond W25Q256），这些字节通过 RX FIFO 回到 U-Boot，`sf probe` 就能识别出 Flash。
+
+**第三步：读镜像启动 Linux**
+
+识别出 Flash 后，U-Boot 用 `sf read` 命令从 Flash 读出 OpenSBI、Linux 内核、initrd、DTB 到内存，然后 `bootm` 启动：
 
 ```text
-sf probe 0:0
-sf read 0x0c100000 0x0 0x14000        # OpenSBI
-sf read 0x08200000 0x100000 0x1a1fe00 # Linux
-sf read 0x0a100000 0x1c00000 0x1eec20 # initrd
-sf read 0x0a000000 0x1f00000 0x1000   # DTB
-bootm 0x0c100000 - 0x0a000000
+sf probe 0:0                              # 探测 CS0 上的 Flash
+sf read 0x0c100000 0x0 0x14000           # 读 OpenSBI 到 0x0c100000
+sf read 0x08200000 0x100000 0x1a1fe00    # 读 Linux 内核到 0x08200000
+sf read 0x0a100000 0x1c00000 0x1eec20    # 读 initrd 到 0x0a100000
+sf read 0x0a000000 0x1f00000 0x1000      # 读 DTB 到 0x0a000000
+bootm 0x0c100000 - 0x0a000000            # 启动 Linux
 ```
 
-Linux 侧就是 `dw_spi_mmio` probe → `spi-nor`（w25q256）→ MTD 分区 erase + pwrite + pread + 校验。这条 `-bios` 读 Flash 的链在 V1/V2/V3 每轮升级后都是必跑的验收，dts 该改的改了（bus-width 8→1、spi0 显式 okay 之类），输出基本一样。
+Linux 侧启动后，`dw_spi_mmio` 驱动 probe，`spi-nor` 层识别到 w25q256，MTD 分区能做 erase/write/read 校验。这一串跑通了，标准 PIO 路径就算完成。
 
 ## 4. QSPI + IDMA：测着测着就绑定到一起了
 
 ### 4.1 为什么两个是一体的
 
-QSPI 和 IDMA 原本是分开想的，做 QSPI 的时候才发现它俩绑在一起：**SDK 在总线宽度大于 1 时，走的是控制器内部 IDMA，而不是普通 PIO dummy**（`SPI_FRF != Standard` 时传输泵会停，数据搬运交给 IDMA）。所以 QSPI 的验证绕不开 IDMA，两个就一起做了。
+QSPI 和 IDMA 原本计划分开实现，但检查 QSPI 路径后发现两者不能分离：**SDK 在总线宽度大于 1 时使用控制器内部 IDMA，而不是普通 PIO dummy**（`SPI_FRF != Standard` 时传输泵停止，由 IDMA 搬运数据）。因此 QSPI 验证必须包含 IDMA。
 
 ### 4.2 QSPI 四阶段事务
 
-普通 enhanced 模式把一次事务拆成四阶段：指令 → 地址 → dummy → 数据。`SPI_CTRLR0` 的关键字段：
+做 QSPI 前先理清楚一件事：普通 enhanced 模式下，一次事务不是简单地把字节推上总线，而是拆成**指令 → 地址 → dummy → 数据**四个阶段。每个阶段走几条线、多少位，由 `SPI_CTRLR0` 里的字段决定：
 
 | 字段           | 含义                             |
 | ------------ | ------------------------------ |
@@ -394,68 +386,68 @@ QSPI 和 IDMA 原本是分开想的，做 QSPI 的时候才发现它俩绑在一
 | `DATA_WIDTH` | 数据宽度（1/2/4/8 位）                |
 | `WAIT`       | dummy cycles 数                 |
 
+为什么会有 dummy 阶段？因为 Quad 读 Flash 时，数据阶段会从单线切到 4 线，总线切换需要几个空时钟让 Flash 跟上，同时 Flash 还需要 mode 字节来确认接下来走几线。这些时钟不携带数据，所以叫 dummy。
+
+我们建模这边要做的，就是按这四个阶段依次往 SSI 总线发帧：先发指令、再发地址、再发 dummy 时钟、最后发数据（或收数据）。阶段之间靠 `phase` 状态区分，每个阶段走完再切下一个。
+
 !!! bug "dummy cycles 的字节宽 vs 线宽（上游 m25p80 更新暴露的）"
 
-````
-**现象**：rebase 到新 QEMU 基线后 qtest 红掉——`/qspi/dual-quad-output-read` 报 `actual != expected`。rebase 无冲突、构建也成功，纯粹是测试过不了。
+    **现象**：rebase 到新 QEMU 基线后 qtest 红掉——`/qspi/dual-quad-output-read` 报 `actual != expected`。rebase 无冲突、构建也成功，纯粹是测试过不了。
 
-**机制**：这是 K230 SSI 和上游 `m25p80` 对 dummy phase 的"旧契约"不再一致。背景是：QEMU 主线**最近刚更新过 m25p80 的 dummy-byte 换算**（Winbond 等 flash 的 `0x3b`/`0x6b`，8 个 dummy clocks 只应发 1 个 SSI dummy byte），而上游从设备模型更新了，我的主设备模型还按旧契约发——K230 qtest 对 `0x3b`/`0x6b` 用 `SPI_CTRLR0.WAIT_CYCLES=8`，这个字段的单位是 dummy clock cycles，旧实现直接把它当成 `ssi_transfer()` 的次数，发了 8 个 SSI 字节。
+    该问题由 QEMU 主线更新 m25p80 的 dummy-byte 换算后暴露：对 Winbond 等 Flash 的 `0x3b`/`0x6b` 读命令，8 个 dummy clocks 只应发送 1 个 SSI dummy byte。上游从设备模型修正后，控制器模型仍按旧契约发送。K230 qtest 对 `0x3b`/`0x6b` 设置 `SPI_CTRLR0.WAIT_CYCLES=8`；该字段单位是 dummy clock cycles，旧实现却将它直接当成 `ssi_transfer()` 次数，发送了 8 个 SSI 字节。
 
-多余的 7 个零字节会在 flash 已进入数据阶段后消耗真实数据，控制器读到的就是偏移后的内容——**m25p80 变对了，我的模型还按旧契约发**。
+    多余的 7 个零字节会在 Flash 已进入数据阶段后消耗真实数据，使控制器读到偏移后的内容。根因是主、从设备模型对 dummy phase 的字节数约定不一致。
 
-**修法**：换算必须依据 dummy phase 宽度：`TRANS_TYPE=0`（1-1-2/4 output read）走单线 dummy phase；`TRANS_TYPE=1/2` 按 Dual/Quad 的 2/4 线宽计算，发送次数是 `ceil(WAIT_CYCLES * lines / 8)`。Quad I/O 的 mode byte 仍是独立字段，不能重复计入 dummy bytes：
+    **修法**：换算必须依据 dummy phase 宽度：`TRANS_TYPE=0`（1-1-2/4 output read）走单线 dummy phase；`TRANS_TYPE=1/2` 按 Dual/Quad 的 2/4 线宽计算，发送次数是 `ceil(WAIT_CYCLES * lines / 8)`。Quad I/O 的 mode byte 仍是独立字段，不能重复计入 dummy bytes：
 
-```c
-static uint32_t k230_dw_ssi_dummy_bytes(uint32_t spi_frf,
-                                         uint32_t trans_type,
-                                         uint32_t wait_cycles)
-{
-    uint32_t lines = 1;
+    ```c
+    static uint32_t k230_dw_ssi_dummy_bytes(uint32_t spi_frf,
+                                             uint32_t trans_type,
+                                             uint32_t wait_cycles)
+    {
+        uint32_t lines = 1;
 
-    if (trans_type != 0) {
-        lines = spi_frf == 1 ? 2 : 4;
+        if (trans_type != 0) {
+            lines = spi_frf == 1 ? 2 : 4;
+        }
+
+        return DIV_ROUND_UP(wait_cycles * lines, 8);
     }
+    ```
 
-    return DIV_ROUND_UP(wait_cycles * lines, 8);
-}
-```
+    换算依据是这样的：`WAIT_CYCLES` 是**时钟周期**数，但 m25p80 模型按**字节**消化 dummy。1 个时钟周期在单线下传 1 位、双线下传 2 位、四线下传 4 位，所以要先乘线宽得到总位数，再除以 8 得到字节数。
 
-**教训**：跟上游基线保持同步。上游修了从设备模型，我的主设备还按旧契约发，rebase 一重放就暴露。这也是为什么每次 rebase 都要跑全量 qtest，光看构建过远远不够。
-````
+    **教训**：rebase 后必须运行全量 qtest。构建成功不能证明主、从设备之间的事务契约仍然一致。
 
 ### 4.3 IDMA：同步还是异步
 
-IDMA 是控制器自己带的 AXI master，不是外接 DMA。一开始想做成异步的（QEMU 里有现成的 stream 模型：master/slave 用 `stream_push()`/`stream_can_push()` 互动，能表达 backpressure 和分块搬运），但翻 SDK 驱动发现：
+IDMA 是控制器自带的 AXI master，不是外接 DMA。异步方案可以复用 QEMU 的 stream 模型：master/slave 通过 `stream_push()`/`stream_can_push()` 表达 backpressure 和分块搬运；但 SDK 驱动的使用方式并不需要该行为：
 
 ??? note "SDK 驱动的 IDMA 用法"
 
-````
-U-Boot 的 `designware_spi.c` 和 RT-Smart 的 `drv_spi.c` 都是**轮询 `DONE` 位**的：
+    U-Boot 的 `designware_spi.c` 和 RT-Smart 的 `drv_spi.c` 都是**轮询 `DONE` 位**的：
 
-```c
-/* 伪代码：SDK 驱动的 IDMA 使用方式，摘自 RT-Smart drv_spi.c */
-spi->dmacr = DMACR_IDMAE | DMACR_AINC | ...;
-spi->spi_ar = flash_offset;
-spi->axi_ar0 = dram_addr;
-spi->axi_awlen = length;
-spi->ser = 1 << cs;
-spi->ssienr = 1;
-/* 然后……就死等 DONE */
-rt_event_recv(..., BIT(SSI_DONE) | BIT(SSI_AXIE), ...);
-spi->ser = 0;
-spi->ssienr = 0;
-```
-````
+    ```c
+    /* 伪代码：SDK 驱动的 IDMA 使用方式，摘自 RT-Smart drv_spi.c */
+    spi->dmacr = DMACR_IDMAE | DMACR_AINC | ...;
+    spi->spi_ar = flash_offset;
+    spi->axi_ar0 = dram_addr;
+    spi->axi_awlen = length;
+    spi->ser = 1 << cs;
+    spi->ssienr = 1;
+    /* 然后……就死等 DONE */
+    rt_event_recv(..., BIT(SSI_DONE) | BIT(SSI_AXIE), ...);
+    spi->ser = 0;
+    spi->ssienr = 0;
+    ```
 
-软件既然死等，QEMU 同步模型就够：写完 `SSIENR=1`，一次性把数据从 Flash 搬到内存，置 `DONE`。异步反而多个 BH、多套 backpressure，软件根本感知不到。
+软件会等待完成事件，因此 QEMU 的同步模型足够：写入 `SSIENR=1` 后一次性将数据从 Flash 搬入内存，再置 `DONE`。异步实现会增加 BH 和 backpressure 状态，但 Guest 无法观察到相应差异。
 
-QEMU 里 DMA 本质是"设备代替 CPU 访问 Guest 内存"，直接 `memcpy` 不行（Guest 物理地址 ≠ Host 虚拟地址，中间隔着 MemoryRegion 翻译），得用 `dma_memory_read()`/`dma_memory_write()` 走 AddressSpace。
+在 QEMU 里，DMA 是设备代替 CPU 访问 Guest 内存。不能直接 `memcpy`，因为 Guest 物理地址并不等于 Host 地址；必须经由 `dma_memory_read()`/`dma_memory_write()` 走 AddressSpace 翻译。
 
 !!! note "什么时候该用 BH 异步"
 
-```
-Bottom Half（`aio_bh_schedule`）用于模拟"真实硬件上后台跑、软件一边干别的"的 DMA。这里软件就是死等 `DONE`，vCPU 反正要停，同步反而更贴合软件行为。同步够用，异步是过度设计。
-```
+    Bottom Half（`aio_bh_schedule`）适合模拟硬件后台传输、软件可以并行继续工作的场景。这里软件会等待 `DONE`，同步完成更贴合 Guest 可观察到的行为；额外引入 BH 和 backpressure 没有收益。
 
 IDMA 也收过一次语义：
 
@@ -465,21 +457,21 @@ IDMA 也收过一次语义：
 
 !!! bug "DONECR 的 read-clear 语义（Linux Quad 组合验证才暴露）"
 
-```
-**现象**：Linux 5.10.4 Quad 的 MTD write/read/cmp 测试失败。
+    **现象**：Linux 5.10.4 Quad 的 MTD write/read/cmp 测试失败。
 
-**机制**：SDK Linux 驱动的 DONE IRQ handler 是**读 `DONECR` 清除中断**（TRM 的 RC 属性：读取返回并清除 DONE 锁存），最初却实现成"读恒为 0、写才清"。后果是 U-Boot 阶段遗留的 DONE latch 在 Linux 打开 DONE IRQ 后变成**陈旧中断**——新事务还没启动，驱动就以为上一个完成了。
+    初版将寄存器清除语义实现错误。SDK Linux 驱动的 DONE IRQ handler 会**读取 `DONECR` 清除中断**（TRM 标为 RC：读取返回并清除 DONE 锁存），模型却实现为“读取恒为 0，写入才清除”。结果 U-Boot 阶段遗留的 DONE latch 在 Linux 打开 DONE IRQ 后成为**陈旧中断**：新事务尚未启动，驱动已将其视作上一次传输完成。
 
-**怎么从 SDK/TRM 找到答案的**：先在 SDK Linux 驱动里找到 DONE 中断的处理函数，看到 IRQ handler 里读了一次 `DONECR`——为什么读一下就能清？回 TRM 12.3 查 `DONECR` 的访问属性，表格里写着 `RC`（read-clear）：读取返回锁存状态并清除事件，写入忽略。两条一对就明白了：TRM 定义了 RC 属性，驱动按 RC 用，模型却按"写清除"实现——读路径压根没清，锁存一直挂着。
+    定位过程是先在 SDK Linux 驱动中找到 DONE 的中断处理函数，看到 IRQ handler 会读取 `DONECR`；再回到 TRM 12.3 核对访问属性，表中标为 `RC`（read-clear），即读取返回锁存状态并清除事件，写入忽略。TRM 定义与驱动用法一致，问题在于模型错误地实现为“写清除”，导致读路径没有清除锁存。
 
-**修法**：改成 `DONECR` read-clear（`AXIECR` 同理）。修完后 Linux 5.10.4 Quad 的 256 B 和 4 KiB MTD 测试全过。
+    **修法**：改成 `DONECR` read-clear（`AXIECR` 同理）。修完后 Linux 5.10.4 Quad 的 256 B 和 4 KiB MTD 测试全过。
 
-**教训**：中断清除语义要对着 SDK 驱动的实际用法抄，不能想当然——TRM 写的是 RC（read-clear），驱动读一下你就得真的清。
-```
+    **教训**：中断清除语义既要核对 TRM 的访问属性，也要对照 SDK 驱动的实际访问方式；寄存器标为 RC 时，模型的读取路径必须真的清除锁存。
 
 ## 5. XIP：把 Flash 当内存读
 
-最后加的是 XIP 模块。`HI_SYS` 是 SoC 级包装寄存器（`0x91585068` 的 `SSI_CTRL`），控制 XIP 使能和三实例模式/休眠。XIP 是给 spi0 挂一个 128 MiB 的 MMIO 窗口 @ `0xc0000000`，CPU 直接当内存读 Flash。
+XIP（eXecute In Place）是最后加的模块，想法很简单：让 CPU 直接把 Flash 当内存读。正常读 Flash 要写寄存器、发命令、等数据，XIP 则是在 spi0 上挂一个 128 MiB 的 MMIO 窗口 @ `0xc0000000`，CPU 读这个地址，模型自动转成一次 SPI 读事务发给 Flash，对软件来说就像读 RAM 一样。
+
+窗口使能还受 `HI_SYS` 里的 `SSI_CTRL`（`0x91585068`）bit 0 门控，关了读就返回 0。整个数据流是这样：
 
 ```mermaid
 flowchart LR
@@ -490,14 +482,14 @@ flowchart LR
     HI["HI_SYS.SSI_CTRL bit0 门控"] -. 关闭时读返回 0 .-> XIPREG
 ```
 
+CPU 读取 `0xc0000000` 时，模型根据 `SPI_CTRLR0` 的线宽选择对应读命令（单线 `0x03`、双线 `0x3b`、四线 `0x6b`），向总线发起事务，再将 Flash 返回的数据交给 CPU。对软件而言，这段访问表现为普通内存读取。
+
 !!! warning "XIP 窗口的两个 QEMU 坑"
 
-```
-1. **超大访问**：窗口默认被 QEMU 当普通 RAM，guest 一次 `memcpy` 可能发超大访问，但 SPI NOR 只能按事务读。所以 XIP ops 的 `.impl.max_access_size` 设成 4 字节，让 QEMU 自动拆成多次 word 读。
-2. **4-byte address mode**：W25Q256 在 `sf probe` 后会进 4-byte address mode，XIP 寄存器必须在所有 `sf read` 完成后重新配置，opcode 用 `0x13`（4-byte Read）。用 3-byte read 配置，XIP 读取会错位。实机调试才发现的。
-```
+    1. **超大访问**：窗口默认被 QEMU 当普通 RAM，guest 一次 `memcpy` 可能发超大访问，但 SPI NOR 只能按事务读。所以 XIP ops 的 `.impl.max_access_size` 设成 4 字节，让 QEMU 自动拆成多次 word 读。
+    2. **4-byte address mode**：W25Q256 在 `sf probe` 后会进 4-byte address mode，XIP 寄存器必须在所有 `sf read` 完成后重新配置，opcode 用 `0x13`（4-byte Read）。用 3-byte read 配置，XIP 读取会错位。实机调试才发现的。
 
-验证输出，U-Boot 直接从映射窗口读 uImage 头：
+验证的时候，U-Boot 直接从映射窗口读 uImage 头：
 
 ```text
 c0000000: 56190527
@@ -511,93 +503,71 @@ meta-k230 initramfs starting...
 ~ #
 ```
 
-`56190527` 是 OpenSBI uImage 的 magic，能读到并且 checksum OK，说明 XIP 窗口真的把 Flash 里的 OpenSBI 映射出来了。
+`56190527` 是 OpenSBI uImage 的 magic。它能从该地址读出且 checksum 通过，表明 CPU 的确通过 XIP 窗口读取了 Flash。
 
 ## 6. 上游 review：该拆了
 
 V1 后期，Bin Meng 在 patch 1 上给了一个反馈：**把模型拆成两层**——一个通用的 Synopsys DesignWare SSI 控制器模型，加一个可选的 K230 专有 wrapper。目的是让这个模型以后能被其他用 DW SSI IP 的 SoC 复用。
 
-我当时的第一反应是"凭什么是通用的"，结果一翻 TRM 和驱动，证据全摆在那：
+是否应将 K230 控制器拆为通用模型，需要由 TRM、驱动和 QEMU 现有实现共同判断。三条证据指向相同结论：
 
-1. TRM 自己承认是 Synopsys IP：`VERSION` 寄存器那段原文，加全文大量 `SSIC_HAS_*` 这种 Synopsys 参数化配置项；
-2. U-Boot 的 `designware_spi.c` 就是通用 driver：Denx 维护，基于 Linux `drivers/spi/spi-dw.c`，K230 SDK 只在顶部改了一行；
-3. QEMU 已有先例：`hw/i2c/designware_i2c.c` 就是 DW I2C 的通用模型，通用层加属性就够了。
+1. **TRM 自己承认是 Synopsys IP**：`VERSION` 寄存器那段原文写着 "Contains the hex representation of the Synopsys component version"，全文还大量出现 `SSIC_HAS_*` / `SSIC_*` 这种 Synopsys IP 的 Verilog 参数化配置项——这完全是第三方 IP 集成手册的写法，不是自研控制器的风格。
+2. **U-Boot 的** **`designware_spi.c`** **本来就是通用 driver**：文件头注释写着 Denx 维护，Copyright Stefan Roese / Sean Anderson，基于 Linux `drivers/spi/spi-dw.c`。K230 SDK 只在顶部改了一行 `#define SSIC_HAS_DMA 2`——说明软件侧早就是按通用 IP 写的驱动。
+3. **QEMU 已有先例**：`hw/i2c/designware_i2c.c` 就是 Synopsys DW I2C 的通用模型，`TYPE_DESIGNWARE_I2C`，没挂任何 SoC wrapper——通用层加属性就够了。
 
-结论很清楚：该拆。但 V1 收尾时我没拆——重点是收敛启动路径，让 U-Boot 真的能从 SPI NOR 起来。拆分是个大重构，得重新设计模型组织、把寄存器按通用/K230 专有分类。这些事放到 V2 做，V1 先把功能跑通、把能 review 的东西稳住。
+这三条证据说明，继续按 K230 私有设备维护并不合适。于是我就开始了V2版本的改良
 
 ## 7. V2/V3：拆成通用模型
 
 ### 7.1 拆分
 
-V1 发完动手拆。关键架构变化：
+V2主要改动有三项：
 
-- 通用模型 `TYPE_DW_SSI`（后来 V3 改名 `TYPE_DWC_SSI`）不再引用任何 K230 概念，实例差异全部走 `DwSsiConfig` 属性（num-cs、fifo-depth、imr-reset），想复用就传参数；
-- HI\_SYS 反向指针摘掉了，XIP 使能从"SSI 反向持有 K230 指针"变成 GPIO `xip-enable` input——通用层对 K230 一无所知，干净；
-- **第一批只发 Standard PIO，enhanced、IDMA、XIP 推迟为独立 follow-up series**。
+- **实例差异全部属性化**：通用模型 `TYPE_DW_SSI`（后来 V3 改名 `TYPE_DWC_SSI`）不再引用任何 K230 概念，实例差异全部走 `DwSsiConfig` 属性（num-cs、fifo-depth、imr-reset）。想复用就传参数，别的 SoC 用同一个模型只需要填不同的配置。
+- **去掉 HI\_SYS 反向指针**：V1 里 SSI 反向持有 K230 的指针去问 HI\_SYS 状态。V2 改成 GPIO `xip-enable` input——HI\_SYS 作为外部信号驱动这个 GPIO，通用层对 K230 一无所知。
+- 鉴于V1出来的3000+行代码，上游review压力也很恐怖，所以我再V2特地做了改良，只筛选了第一层次的standard spi，这样技能支持dw ssi模型，又不影响整个k230的启动路径，也算个不错的抉择。
 
-!!! note "为什么 V2 只裁剪到 Standard PIO"
-
-```
-不是做不了，是**故意裁的**。V2 是架构大改：文件重命名、类型改名、属性化、HI_SYS 解耦，本质是一次重构。如果一次性把 enhanced/IDMA/XIP 全搬过来，patch 数量、代码量、review 压力都会爆炸——V1 那 11 个补丁 1700+ 行已经让 reviewer 很吃力了。所以第一批只保 Standard PIO 闭环：模型更小、review 更快、架构变化更容易被接受。等架构站稳了，enhanced/IDMA/XIP 再以独立 series 慢慢加回来——**功能可以分步推进，架构一次别动太大**。这也是从上游"每个补丁只做一件事"里长出来的思路。
-```
-
-拆完的 5-patch 系列（08-02 发送）：
-
-| # | 标题                                                          | 职责                                 |
-| - | ----------------------------------------------------------- | ---------------------------------- |
-| 1 | hw/ssi: Add Synopsys DesignWare SSI standard PIO controller | 通用 DW SSI 本体：寄存器、FIFO、四种 TMOD，属性驱动 |
-| 2 | hw/ssi: Add DesignWare SSI standard interrupt support       | 9 路 IRQ 输出                         |
-| 3 | hw/riscv/k230: Instantiate DesignWare SSI controllers       | K230 三个实例落地                        |
-| 4 | hw/riscv/k230: Route SSI interrupts to the PLIC             | 接到 PLIC                            |
-| 5 | hw/riscv/k230: Attach a standard SPI NOR flash              | spi0 CS0 挂 m25p80                  |
+按照 patch 1 先建立可编译、可测试的通用控制器，patch 2 增加中断，patch 3\~5 才处理 K230 实例、中断路由和 Flash 挂接。前两项不含 K230 集成逻辑。
 
 ### 7.2 V3：reviewer 让改名
 
-V2 发出去，反馈全集中在 patch 1，两条：
+V2 发出去后，得到反馈
 
-1. **Chao Liu**：DesignWare SSI 的 databook 是 Synopsys 私有的（要注册 myDesignWare 才能下），没有公开链接。总不能一句"没有"就完事——把实现依据的公开资料整理成三类：K230 TRM（寄存器直接依据）、Intel Arria 10 HPS TRM 第 20 章（DW APB 家族对照）、Linux `spi-dw-core.c`/`spi-dw.h`/`snps,dw-apb-ssi.yaml`（软件怎么访问的对照）。
-2. **Anirudh（Tenstorrent）**：`dw-apb-ssi` 和 `dwc-ssi` 这俩变体，CTRLR0 的 TMOD 位位置根本不一样——APB 在 bit 8/9，DWC 在 bit 10/11。查证属实（TMOD、DFS、FRF、SCPH/SCPOL 布局全不一样）。
+1. **Anirudh（Tenstorrent）**：`dw-apb-ssi` 和 `dwc-ssi` 两个变体的 CTRLR0.TMOD 位位置不同：APB 在 bit 8/9，DWC 在 bit 10/11。复核后发现 TMOD、DFS、FRF、SCPH/SCPOL 的布局均不相同。因此 V3 将全系列 `dw_ssi` 改为 `dwc_ssi`，同步更新文件名、Kconfig、Meson、头文件和 qtest，并明确排除 `dw-apb-ssi` 变体。
 
 ### 7.3 发 V2 后自审出的四个 PIO 语义 bug
 
-除了接招，发完 V2 又回头把 PIO 路径从头审了一遍，审出四个隐藏 bug，全是 Standard-only 范围内的：
+V2 发送后，趁着还没得评审的时候，我自己按寄存器语义重新审查 PIO 路径，发现四个 Standard-only 范围内的 bug。它们都暴露了此前 qtest 没有覆盖的边界：
 
-| Bug                        | 问题                                                           | 修法                                                                |
-| -------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------- |
-| EEPROM-read 进数据阶段太早        | 每次 DR 写入就立即跑 transfer，第一字节 opcode 可能直接触发 data phase，后面地址没机会发 | 修 command/data 分界，qtest 用"多字节 command + 非零地址 + NDF"的真实 flash 用例兜住 |
-| TX-only 长传输要等 guest 读状态才继续 | 64 帧批次的坑——V1 的 pace 修复把推进绑定在 TXFLR/SR 读取上，中断驱动 guest 可能永久等待  | 让 TX FIFO 连续发完，qtest 用 TXFTHR=255 + 256 帧验证从设备全收到                 |
-| RX FIFO 满了居然让传输暂停          | 实现成 backpressure，等 guest 读走——databook 规定是置 RXO、丢新 frame、传输继续 | TR/RO/EEPROM-read 全改成"丢帧继续"                                       |
-| RX-only 把启动 dummy 丢了       | 发完第一个 word 后面固定发 0x00，databook 要求整个传输期间重发同一个 word            | 重发同一 word，qtest 用非零 dummy（0xa5）在 loopback 下验证                     |
+| Bug                        | 问题                                                              | 修法                                                                |
+| -------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------- |
+| EEPROM-read 进数据阶段太早        | 每次 DR 写入就立即跑 transfer，第一字节 opcode 可能直接触发 data phase，后面地址没机会发    | 修 command/data 分界，qtest 用"多字节 command + 非零地址 + NDF"的真实 flash 用例兜住 |
+| TX-only 长传输要等 guest 读状态才继续 | 64 帧批次的坑——V1 的 pace 修复把推进绑定在 TXFLR/SR 读取上，中断驱动 guest 可能永久等待     | 让 TX FIFO 连续发完，qtest 用 TXFTHR=255 + 256 帧验证从设备全收到                 |
+| RX FIFO 满了居然让传输暂停          | 实现成 backpressure，等 guest 读走——databook 规定是置 RXO、丢 new frame、传输继续 | TR/RO/EEPROM-read 全改成"丢帧继续"                                       |
+| RX-only 把启动 dummy 丢了       | 发完第一个 word 后面固定发 0x00，databook 要求整个传输期间重发同一个 word               | 重发同一 word，qtest 用非零 dummy（0xa5）在 loopback 下验证                     |
 
-!!! note "这些 bug 是怎么被翻出来的"
+还有几个边界划分的决定：
 
-```
-四个全是发 V2 后自审发现的——当时用"黑盒合同"重新过了一遍 PIO 状态机，发现 qtest 只覆盖了"软件实际走到的路径"，没覆盖"TRM 定义的合同"。要是 V2 发之前就把边界测全，能省一轮 review。
-```
+- 九路 IRQ 拓扑保留，但 Standard-only 下 DONE/AXIE 恒低、clear 寄存器 RAZ/WI；
+- `SPI_FRF` 没单独放开 writable mask，这个会影响linux启动的状态查询
 
-还有几个"边界怎么划"的决定：
+## 8. 回头看：几条工作方法
 
-- 九路 IRQ 拓扑保留（TRM 和软件集成证据都支持），但 Standard-only 下 DONE/AXIE 恒低、clear 寄存器 RAZ/WI；
-- `SPI_FRF` 没单独放开 writable mask——放开了 guest 会以为有 enhanced 能力，可数据路径压根没有，所以继续固定 Standard 并补"写 Dual/Quad 读回 Standard"的测试；
-- 不为测试单独造通用 machine，直接拿 K230 machine 当测试床。
+下面几条不是预先定下的原则，而是在具体问题里反复验证过的做法。
 
-V3 五个 commit 重写完成，qtest 收敛成 14 项，构建、checkpatch、`git diff --check`、残留搜索、参考链接全过。
+**先看 guest 碰什么，再决定模型做什么。** 写之前跑 unimplemented 日志看它碰哪些地址，写完起 guest 确认没被打扰——IOMUX 和后面每个外设都是这么收尾的。这套动作我现在已经成习惯了。
 
-## 8. 这次项目沉淀了什么
+**TRM 给定义，SDK 给用法。** 寄存器字段、时序和模式定义看 TRM；哪个 TMOD 在什么场景使用、中断如何清除、DMA 如何触发，则看 SDK 驱动。EEPROM\_READ 卡死和 DONECR 陈旧中断，都是把这两条线索对照起来才定位。两者不一致时，应记录证据、按具体用例决策，而不是替上游做未经证实的结论；这是 mentor 一直强调的要求，也是在这次排查中验证过的做法。
 
-回头看，这几个月沉淀下来的东西其实就几条，都是踩坑踩出来的：
+**建模取舍看软件怎么用。** 软件等待 `DONE` 就采用同步模型；没有 Guest 消费者的副作用不做（IOMUX 的 pin function、XIP 的线级时序），先划清边界；每次 rebase 都跑全量 qtest，不能只看构建。QEMU 主线现有代码也提供了有价值的参考，例如 designware\_i2c 的拆分先例，以及 sifive、versal 等 SSI 模型的阶段机结构。
 
-- **先看 guest 碰什么，再决定模型做什么**。写之前跑 unimplemented 日志，写完起 guest 确认没被打扰——IOMUX 和每个后续外设都是这么收尾的。
-- **TRM 给定义，SDK 给用法**。寄存器字段、时序、模式定义看 TRM；"哪个 TMOD 在什么场景用""中断怎么清""DMA 怎么触发"看 SDK 驱动。EEPROM\_READ 卡死和 DONECR 陈旧中断，都是这两条线索一对才定位的。两者对不上时，记录证据、按用例决策、不替上游下结论。
-- **建模取舍看软件怎么用**。软件死等 `DONE` 就同步（同步够用，异步是过度设计）；没人消费的副作用不做（IOMUX 的 pin function、XIP 的线级时序），先划边界；每次 rebase 跑全量 qtest，光看构建过远远不够。
-- **上游交互**：认真参考 reviewer 的建议、先查证再改，保证每次修改回归验证完整，不影响先前的基线。
-- **多参考 QEMU 主线现有代码**：学习优秀实现和架构，争取复用（designware\_i2c 拆分先例、sifive/versal 等 SSI 模型的阶段机结构都是这么来的）。
+上游交互同样需要先查证再修改，并在每次调整后完成回归验证，避免破坏已有基线。这是几轮 review 后形成的工作要求。
 
-反思：第一版把所有东西塞进 `k230_dw_ssi.c`（1754 行）是为了快速跑通，代价是 V2 要重构。如果重来一次，会在一开始就分层——先把通用寄存器壳搭好，再在 K230 wrapper 里填实例化参数。不过话说回来，没有 V1 的"一锅炖"，可能也搞不清哪些是通用的、哪些是 K230 专有的——正是 V1 的混乱催生了 V2 的拆分需求。
+最后是一个取舍上的反思：第一版将所有功能放进 `k230_dw_ssi.c`（1754 行），是为了尽快跑通启动路径，代价是 V2 必须重构。若重新开始，我会更早分层：先建立通用寄存器模型，再由 K230 集成层提供实例参数。不过没有 V1 的集中实现，也未必能清楚划出通用部分与 K230 专有部分；V1 的问题正是 V2 拆分的依据。
 
 ## 9. 后续
 
-这个项目还没完。V2 第一批只发了 Standard PIO，是故意裁小的；后续的 enhanced（QSPI）、IDMA、XIP 会以独立的 follow-up series 继续贡献——等前面的贡献在上游稳定下来，再一个系列一个系列地推。功能分步推进，架构一次别动太大，这是从这一路学到的节奏。
+项目还没有结束。V3 第一批只提交 Standard PIO；enhanced（QSPI）、IDMA、XIP 将在前序系列稳定后分别推进。
 
 ## 参考资料
 
@@ -611,4 +581,4 @@ V3 五个 commit 重写完成，qtest 收敛成 14 项，构建、checkpatch、`
 
 \[5] QEMU DesignWare I2C 通用模型先例（hw/i2c/designware\_i2c.c）. <https://github.com/qemu/qemu>
 
-\[6] QEMU Camp 训练营仓库。<https://github.com/gevico/qemu-camp-tutorial>
+\[6] QEMU Camp 训练营仓库。 <https://github.com/gevico/qemu-camp-tutorial>
