@@ -1,11 +1,11 @@
-# K230 冷启动全链路:启动链、镜像格式与排障
+# K230 冷启动全链路：启动链、镜像格式与排障
 
 !!! note "主要贡献者"
 
     - 作者：[@flamboyante](https://github.com/flamboyante)
-    - 技术细节基于实验记录整理,或有疏漏,欢迎指正。
+    - 技术细节基于实验记录整理，或有疏漏，欢迎指正。
 
-K230 的冷启动链路已经在 QEMU 上跑通:SDK 一条 `make CONF=...` 命令产出 32MiB SPI NOR 镜像,镜像可以直接启动到 Linux shell。本文记录这条链路的完整过程:QEMU 侧补了什么、SDK 改了哪些文件、镜像是什么格式,以及踩过的坑。当前阶段的目标是先把 SPI NOR 这条冷启动链跑通;SD 卡启动也在计划内,这次的链路设计和改动为此留了位置。
+K230 的冷启动链路已经在 QEMU 上跑通:SDK 一条 `make CONF=...` 命令产出 32MiB SPI NOR 镜像，镜像可以直接启动到 Linux shell。本文记录这条链路的完整过程:QEMU 侧补了什么、SDK 改了哪些文件、镜像是什么格式，以及踩过的坑。当前阶段的目标是先把 SPI NOR 这条冷启动链跑通;SD 卡启动也在计划内，这次的链路设计和改动为此留了位置。
 
 ## 1. QEMU 验证分支：来源与组成
 
@@ -32,15 +32,15 @@ QEMU 主线的 K230 启动路径只有 `k230_direct_boot()` 和 `k230_firmware_b
 
 ## 2. BootROM 没有公开规范
 
-真机的启动链路:
+真机的启动链路：
 
 ```
 CPU reset → BootROM → SPL(在 SRAM)→ U-Boot(在 DDR)→ OpenSBI → Linux
 ```
 
-BootROM 是芯片出厂烧在 ROM 里的一段代码,负责从启动介质读第一级镜像。K230 的 BootROM 支持多种启动介质(SPI NOR、SD 卡、NAND 等),但具体指令序列、读介质用的协议细节、字节交换算法都没有公开文档,QEMU 无法模拟一段没有规范的代码。本次先做 SPI NOR 介质,SD 卡是后续目标。
+BootROM 是芯片出厂烧在 ROM 里的一段代码，负责从启动介质读第一级镜像。K230 的 BootROM 支持多种启动介质 (SPI NOR、SD 卡、NAND 等),但具体指令序列、读介质用的协议细节、字节交换算法都没有公开文档，QEMU 无法模拟一段没有规范的代码。本次先做 SPI NOR 介质，SD 卡是后续目标。
 
-主线的两个 boot 函数都是把现成固件喂进内存,冷启动需要的是从 Flash 读镜像再启动——中间缺的正是 BootROM 这一环。所以我在分支上补了一个本地 commit(`7730876ca5 feat: full-boot and ctrl0 reg`),加了 `k230_coldboot_boot()`:host 侧直接读 Flash 偏移 0 的内容,按 BootROM 的方式还原字节交换,检查 K230 magic,拆 528 字节的 firmware header,把 SPL 写入 `0x80300000`,再设 reset vector 让 CPU 跳过去:
+主线的两个 boot 函数都是把现成固件喂进内存，冷启动需要的是从 Flash 读镜像再启动——中间缺的正是 BootROM 这一环。所以我在分支上补了一个本地 commit(`7730876ca5 feat: full-boot and ctrl0 reg`),加了 `k230_coldboot_boot()`:host 侧直接读 Flash 偏移 0 的内容，按 BootROM 的方式还原字节交换，检查 K230 magic，拆 528 字节的 firmware header，把 SPL 写入 `0x80300000`,再设 reset vector 让 CPU 跳过去：
 
 ```c
 static void k230_coldboot_boot(K230MachineState *s, MachineState *machine)
@@ -67,15 +67,15 @@ static void k230_coldboot_boot(K230MachineState *s, MachineState *machine)
 
 这个 loader 只是验证启动介质时的 host 侧替代实现，不等同于真实 BootROM。BootROM 没有公开规范，这段代码也不作为上游实现提交，只留在本地验证分支。
 
-分支没有推到公开远端,交付靠增量 bundle(94KB)。没有共享远端时,bundle 是标准方式:体积小、不暴露私有历史,别人 clone 官方仓库、checkout 基线、pull bundle 就能拿到完整分支。
+分支没有推到公开远端，交付靠增量 bundle(94KB)。没有共享远端时，bundle 是标准方式：体积小、不暴露私有历史，别人 clone 官方仓库、checkout 基线、pull bundle 就能拿到完整分支。
 
 ## 3. SDK 只改了 7 个文件
 
-QEMU 侧就绪后看 SDK。官方 SDK 要在 QEMU 上冷启动,只改了 7 个文件,共 +585/-12 行:3 处对官方文件的原地修改,3 个复制官方文件改出的板级派生,1 个顶层 defconfig 派生。公共文件没动(`k230.dtsi`、公共 dts 原样保留)。
+QEMU 侧就绪后看 SDK。官方 SDK 要在 QEMU 上冷启动，只改了 7 个文件，共 +585/-12 行:3 处对官方文件的原地修改，3 个复制官方文件改出的板级派生，1 个顶层 defconfig 派生。公共文件没动 (`k230.dtsi`、公共 dts 原样保留)。
 
-三处修改,每一处对应一个 QEMU 与真机的差异:
+三处修改，每一处对应一个 QEMU 与真机的差异：
 
-**第一处:canmv 板级写死从 SD 卡启动。** 官方 `board.c` 里:
+**第一处:canmv 板级写死从 SD 卡启动。** 官方 `board.c` 里：
 
 ```c
 sysctl_boot_mode_e sysctl_boot_get_boot_mode(void)
@@ -84,13 +84,13 @@ sysctl_boot_mode_e sysctl_boot_get_boot_mode(void)
 }
 ```
 
-canmv 真机从 SD 卡启动,所以板级代码覆盖了 SDK 的 weak 实现。QEMU 里当前没有 SD 卡模型,只有 SPI NOR。删掉这个覆盖,回落到底层 weak 实现:它读 boot 区寄存器,而 QEMU 里 boot 区是 unimplemented,读出来全 0,0 对应 NOR 启动。这个改动两边都成立:QEMU 上读 0 = NOR,真机上读 strap 引脚。以后 QEMU 接 SD 卡启动时,同样走这条 weak 路径——让 boot 区返回 SDIO 对应的 strap 值即可,不需要再动板级代码。
+canmv 真机从 SD 卡启动，所以板级代码覆盖了 SDK 的 weak 实现。QEMU 里当前没有 SD 卡模型，只有 SPI NOR。删掉这个覆盖，回落到底层 weak 实现：它读 boot 区寄存器，而 QEMU 里 boot 区是 unimplemented，读出来全 0,0 对应 NOR 启动。这个改动两边都成立:QEMU 上读 0 = NOR，真机上读 strap 引脚。以后 QEMU 接 SD 卡启动时，同样走这条 weak 路径——让 boot 区返回 SDIO 对应的 strap 值即可，不需要再动板级代码。
 
-**第二处:QEMU 没有 PUFS 硬件。** 官方公共头文件里默认开着 `CONFIG_K230_PUFS`。PUFS 是安全启动用的物理防克隆单元,做镜像哈希校验。QEMU 没有这个硬件,这次验证分支开着就过不去。关掉后,U-Boot 校验镜像哈希走软件 `sha256_csum_wd()` 分支。这个改动只针对当前 QEMU 验证，不代表真机板型都要这样配置。
+**第二处:QEMU 没有 PUFS 硬件。** 官方公共头文件里默认开着 `CONFIG_K230_PUFS`。PUFS 是安全启动用的物理防克隆单元，做镜像哈希校验。QEMU 没有这个硬件，这次验证分支开着就过不去。关掉后，U-Boot 校验镜像哈希走软件 `sha256_csum_wd()` 分支。这个改动只针对当前 QEMU 验证，不代表真机板型都要这样配置。
 
 **第三处:T-HEAD 的私有页表位。** 详见 §7.2。
 
-顶层 defconfig 复制了一份,叫 `k230_canmv_qemu_spinor_defconfig`。改的开关只有 5 个:
+顶层 defconfig 复制了一份，叫 `k230_canmv_qemu_spinor_defconfig`。改的开关只有 5 个：
 
 ```diff
 - CONFIG_UBOOT_DEFCONFIG="k230_canmv"
@@ -138,31 +138,31 @@ SPL/U-Boot 能读 NOR；Linux DTS 让内核只去驱动 QEMU 实际提供的那�
 | 阶段        | 运行位置                            | 主要职责                           |
 | --------- | ------------------------------- | ------------------------------ |
 | BootROM   | 片内 ROM(QEMU 里是 `0x91200000` 窗口) | 采样启动模式、选介质、加载 SPL              |
-| SPL       | SRAM,入口 `0x80300000`            | pinmux/时钟/复位、DDR 初始化、加载 U-Boot |
-| 完整 U-Boot | DDR(`0x08000000` 起)             | 读环境变量、加载 OpenSBI+内核            |
-| OpenSBI   | DDR                             | SBI 服务,M-mode → S-mode 交接      |
+| SPL       | SRAM，入口 `0x80300000`            | pinmux/时钟/复位、DDR 初始化、加载 U-Boot |
+| 完整 U-Boot | DDR(`0x08000000` 起)             | 读环境变量、加载 OpenSBI+ 内核            |
+| OpenSBI   | DDR                             | SBI 服务，M-mode → S-mode 交接      |
 | Linux     | DDR                             | 建页表、初始化驱动、挂 rootfs、起 init      |
 
-需要多级的原因:芯片刚通电时 DDR 还没初始化,只有片内一小块 SRAM 能放代码;BootROM 只有几百行,装不下完整的引导加载器。所以先让最小程序(SPL)把 DDR 拉起来,再加载完整的 U-Boot。
+需要多级的原因：芯片刚通电时 DDR 还没初始化，只有片内一小块 SRAM 能放代码;BootROM 只有几百行，装不下完整的引导加载器。所以先让最小程序 (SPL) 把 DDR 拉起来，再加载完整的 U-Boot。
 
 ## 5. SPI NOR 镜像格式
 
-SDK 产出的 `sysimage-spinor32m.img` 是 32MiB,布局(目前先做 SPI NOR 变体;SD 卡镜像的格式和装配链类似,后续按需接入):
+SDK 产出的 `sysimage-spinor32m.img` 是 32MiB，布局 (目前先做 SPI NOR 变体;SD 卡镜像的格式和装配链类似，后续按需接入):
 
 |        偏移 |         大小 | 分区         | 内容                                                    |
 | --------: | ---------: | ---------- | ----------------------------------------------------- |
-|  0x000000 |   0x080000 | spl\_boot  | `swap_fn_u-boot-spl.bin`(SPL,字节交换格式)                  |
+|  0x000000 |   0x080000 | spl\_boot  | `swap_fn_u-boot-spl.bin`(SPL，字节交换格式)                  |
 |  0x080000 |   0x160000 | uboot      | `fn_ug_u-boot.bin`(完整 U-Boot)                         |
 |  0x1e0000 |   0x020000 | uboot\_env | environment(含 bootcmd/bootargs)                       |
 |  0x200000 | \~0xdc0000 | 产品配置包      | quick\_boot/face\_db/sensor/ai\_mode/speckle/rtt\_app |
-|  0xfc0000 |   0x700000 | linux      | `linux_system.bin`(OpenSBI+内核+DTB)                    |
+|  0xfc0000 |   0x700000 | linux      | `linux_system.bin`(OpenSBI+ 内核+DTB)                    |
 | 0x16c0000 |   0x900000 | rootfs     | JFFS2 或 UBI                                           |
 
-两个文件名需要说明:
+两个文件名需要说明：
 
-**`swap_`** **前缀。** SPL 文件名里的 "swap" 指字节交换。SDK 用 `endian-swap.py` 处理过的 SPL 才带这个前缀；本地 loader 按这个产物格式还原字节序。装配时要用 swap 过的版本,不能用原始的。
+**`swap_`** **前缀。** SPL 文件名里的 "swap" 指字节交换。SDK 用 `endian-swap.py` 处理过的 SPL 才带这个前缀；本地 loader 按这个产物格式还原字节序。装配时要用 swap 过的版本，不能用原始的。
 
-**`linux_system.bin`** **的打包链:**
+**`linux_system.bin`** **的打包链：**
 
 ```text
 OpenSBI fw_payload.bin → k230_gzip → fw_payload.bin.gz
@@ -172,50 +172,50 @@ OpenSBI fw_payload.bin → k230_gzip → fw_payload.bin.gz
 → linux_system.bin
 ```
 
-其中"1 字节 rd 占位"是个坑:`mkimage -T multi` 拒绝真正空的 rd 文件(报 `Input file rd is empty`)。官方脚本用 1 字节占位。自己复现时 `printf 'a\n' > rd` 即可,Linux 不会把这个占位当 initramfs。
+其中"1 字节 rd 占位"是个坑：`mkimage -T multi` 拒绝真正空的 rd 文件 (报 `Input file rd is empty`)。官方脚本用 1 字节占位。自己复现时 `printf 'a\n' > rd` 即可，Linux 不会把这个占位当 initramfs。
 
-528 字节的 firmware header 不是 PUFS 专属格式。PUFS 是安全启动的额外校验,firmware header 是所有镜像都有的,内容为 magic + length + type + verify。
+528 字节的 firmware header 不是 PUFS 专属格式。PUFS 是安全启动的额外校验，firmware header 是所有镜像都有的，内容为 magic + length + type + verify。
 
 ## 6. 两条装配路线
 
-**路线 A:自制装配。** 官方 `build-image` 无条件调用 RT-Smart 的构建产物(mkromfs.py、rtthread.\*、big-core opensbi),而 RT-Smart 编译很慢。不想编 RT-Smart,就得绕开官方装配,自己按 genimage-spinor.cfg 的布局逐段拼:
+**路线 A:自制装配。** 官方 `build-image` 无条件调用 RT-Smart 的构建产物 (mkromfs.py、rtthread.\*、big-core opensbi),而 RT-Smart 编译很慢。不想编 RT-Smart，就得绕开官方装配，自己按 genimage-spinor.cfg 的布局逐段拼：
 
 ```text
-按布局表逐段写入:
+按布局表逐段写入：
   SPL @ 0x000000 → U-Boot @ 0x080000 → env @ 0x1e0000
-  → 配置包(可选)→ linux_system.bin @ 0xfc0000 → rootfs @ 0x16c0000
+  → 配置包 (可选)→ linux_system.bin @ 0xfc0000 → rootfs @ 0x16c0000
 每段检查:K230 firmware header / JFFS2 magic / 大小不越界
 最后补 0xff 到 32MiB
 ```
 
-rootfs 有两种格式:JFFS2(`mkfs.jffs2`,链路短)或 UBI/UBIFS(`mkfs.ubifs` + `ubinize`,官方产品常用)。都能放进 9MiB 分区,装配时按 env 里的 `rootfstype` 配套。
+rootfs 有两种格式:JFFS2(`mkfs.jffs2`,链路短) 或 UBI/UBIFS(`mkfs.ubifs` + `ubinize`,官方产品常用)。都能放进 9MiB 分区，装配时按 env 里的 `rootfstype` 配套。
 
-自制路线的代价:layout 要自己维护,`sdk_autoconf.h` 里的分区偏移、DTS 分区、genimage cfg 三处要手动对齐——§7.1 的坑就出在这里。
+自制路线的代价:layout 要自己维护，`sdk_autoconf.h` 里的分区偏移、DTS 分区、genimage cfg 三处要手动对齐——§7.1 的坑就出在这里。
 
-**路线 B:官方一键编译**一条命令走完:
+**路线 B:官方一键编译**一条命令走完：
 
 ```text
 make CONF=k230_canmv_qemu_spinor_defconfig -j1
   → linux → rt-smart → buildroot → uboot → opensbi → build-image(genimage 装配)
 ```
 
-产物是官方 `sysimage-spinor32m_jffs2.img`(JFFS2 变体)和 `sysimage-spinor32m.img`(UBI 变体)。镜像布局、分区偏移、DTS 分区全部由官方脚本自动对齐,不需要手动维护。
+产物是官方 `sysimage-spinor32m_jffs2.img`(JFFS2 变体) 和 `sysimage-spinor32m.img`(UBI 变体)。镜像布局、分区偏移、DTS 分区全部由官方脚本自动对齐，不需要手动维护。
 
-如果 rootfs 超出 9MiB 分区(SDK 默认 buildroot 配置装 73 个包),不需要改任何 SDK 脚本,顶层配置一行切换:
+如果 rootfs 超出 9MiB 分区 (SDK 默认 buildroot 配置装 73 个包),不需要改任何 SDK 脚本，顶层配置一行切换：
 
 ```text
 CONFIG_BUILDROOT_DEFCONFIG="k230d_canmv"
 ```
 
-从 73 包的 `k230_evb` 切到 31 包的 `k230d_canmv` 后,rootfs.jffs2 从 12.4MB 降到 5.7MB。
+从 73 包的 `k230_evb` 切到 31 包的 `k230d_canmv` 后，rootfs.jffs2 从 12.4MB 降到 5.7MB。
 
-## 7. 排障:四个卡点
+## 7. 排障：四个卡点
 
-### 7.1 mtd9 之谜:官方脚本动态生成分区
+### 7.1 mtd9 之谜：官方脚本动态生成分区
 
-症状:早期自制路线手写 12 个 MTD 分区(rootfs 排第 11,bootargs 写 `mtdblock11`),切到官方流程后镜像挂不上 rootfs,还出现 DTS 分区重复两套。
+症状：早期自制路线手写 12 个 MTD 分区 (rootfs 排第 11,bootargs 写 `mtdblock11`),切到官方流程后镜像挂不上 rootfs，还出现 DTS 分区重复两套。
 
-原因:官方 `menuconfig_to_code.sh` 在 `prepare_memory` 阶段动态重写 Linux DTS 的分区——把 DTS 里 `partition@0` 到 `all_flash` 之间的内容删掉,插入脚本生成的分区:
+原因：官方 `menuconfig_to_code.sh` 在 `prepare_memory` 阶段动态重写 Linux DTS 的分区——把 DTS 里 `partition@0` 到 `all_flash` 之间的内容删掉，插入脚本生成的分区：
 
 ```bash
 # tools/menuconfig_to_code.sh
@@ -225,19 +225,19 @@ sed -i -e "${part_s},${part_e}d"  ${LINUX_DTS_PATH}
 sed -i -e "$((part_s-1)) r t.sh" ${LINUX_DTS_PATH}
 ```
 
-生成的分区顺序:spl→uboot→cfg 包→rtt→linux→rootfs→all\_flash,rootfs 排第 9 位,即 mtd9。所以官方 env 里写 `mtdblock9` 是对的,手写的 `mtdblock11` 反而错了。
+生成的分区顺序:spl→uboot→cfg 包→rtt→linux→rootfs→all\_flash,rootfs 排第 9 位，即 mtd9。所以官方 env 里写 `mtdblock9` 是对的，手写的 `mtdblock11` 反而错了。
 
-看着像 bug 的原因:不知道这个脚本的话,会看到"官方 env 写 9,但官方 DTS 只有 spl\_boot+all\_flash 两个分区"。实际上 DTS 在编译前已被脚本改写。
+看着像 bug 的原因：不知道这个脚本的话，会看到"官方 env 写 9，但官方 DTS 只有 spl\_boot+all\_flash 两个分区"。实际上 DTS 在编译前已被脚本改写。
 
-额外的坑:脚本用 `grep` 匹配 `partition@0` 和 `all_flash` 的行号。如果 DTS 注释里出现 `all_flash` 字样,行号会错乱。遇到过:注释写了"分区保持官方骨架(spl\_boot+all\_flash)",脚本把注释行当成了分区边界。删掉注释后恢复。
+额外的坑：脚本用 `grep` 匹配 `partition@0` 和 `all_flash` 的行号。如果 DTS 注释里出现 `all_flash` 字样，行号会错乱。遇到过：注释写了"分区保持官方骨架 (spl\_boot+all\_flash)",脚本把注释行当成了分区边界。删掉注释后恢复。
 
 这次的问题不是分区表本身写错，而是没有先看 `menuconfig_to_code.sh` 的改写步骤。搞清楚脚本什么时候重写 DTS 后，mtd9 和 env 里的编号就能对上了。
 
 ### 7.2 PTE/MAEE:T-HEAD 高位页表位
 
-症状:SDK 官方编译的 Linux 内核在 QEMU 上起不来,日志没有明确报错,死得很早。
+症状:SDK 官方编译的 Linux 内核在 QEMU 上起不来，日志没有明确报错，死得很早。
 
-原因:T-HEAD C9xx 内核的页表用了私有 MAEE 高位属性位(bit 59-63):
+原因:T-HEAD C9xx 内核的页表用了私有 MAEE 高位属性位 (bit 59-63):
 
 ```c
 /* T-HEAD C9xx extend */
@@ -258,52 +258,52 @@ QEMU 只认标准 RISC-V PTE(bit 0-9),高位置位后页表解析错乱。修复
 #define _PAGE_SO	0   /* Strong Order (T-HEAD MAEE, QEMU 置 0) */
 ```
 
-不能直接删宏:`_PAGE_CHG_MASK` 等位置引用着它们,删了编译不过。置 0 语义等价,是最小改动。
+不能直接删宏：`_PAGE_CHG_MASK` 等位置引用着它们，删了编译不过。置 0 语义等价，是最小改动。
 
 内核能编出来、能加载，并不说明 QEMU 能按这套页表属性启动；这里卡的是 T-HEAD 私有位和标准 RISC-V PTE 之间的差异。
 
 ### 7.3 buildroot 不自动卸载旧包
 
-症状:buildroot 从 `k230_evb`(73 包)切到 `k230d_canmv`(31 包)后,rootfs.cpio 还是 38MB,蓝牙工具还在。
+症状:buildroot 从 `k230_evb`(73 包) 切到 `k230d_canmv`(31 包) 后，rootfs.cpio 还是 38MB，蓝牙工具还在。
 
-原因:buildroot 靠 `.config` 判断要装什么,但不会卸载 target/ 里已装的旧文件。配置变了,包的 stamp 还在,它认为已安装。
+原因:buildroot 靠 `.config` 判断要装什么，但不会卸载 target/ 里已装的旧文件。配置变了，包的 stamp 还在，它认为已安装。
 
-修复:删掉 `target/` 目录重编,只重装 target 包,host 工具缓存保留。
+修复：删掉 `target/` 目录重编，只重装 target 包，host 工具缓存保留。
 
-结论:配置切换不等于干净重编。换配置后要么删 target,要么 `make clean`。
+结论：配置切换不等于干净重编。换配置后要么删 target，要么 `make clean`。
 
 ### 7.4 genimage 的 RUNPATH 指向构建机
 
-症状:`tools/genimage` 报 `cannot open shared object file: libconfuse.so.2`。
+症状：`tools/genimage` 报 `cannot open shared object file: libconfuse.so.2`。
 
-原因:SDK 编译出的 genimage 二进制,RUNPATH 里写死了编译它那台机器的 SDK checkout 路径。换机器或换目录后找不到动态库。
+原因:SDK 编译出的 genimage 二进制，RUNPATH 里写死了编译它那台机器的 SDK checkout 路径。换机器或换目录后找不到动态库。
 
-修复:建软链,把 RUNPATH 里的路径桥接到本地 buildroot host/lib。零改动 SDK。这个坑在"二进制产物自带 RUNPATH"的场合普遍存在,换工作目录就可能复现。
+修复：建软链，把 RUNPATH 里的路径桥接到本地 buildroot host/lib。零改动 SDK。这个坑在"二进制产物自带 RUNPATH"的场合普遍存在，换工作目录就可能复现。
 
-另外,老 buildroot(2020.02)在新宿主系统上编译可能遇到 m4/fakeroot/cmake/scons 的版本兼容问题(glibc 接口变更、cmake 4 移除旧版本兼容等)。SDK 的 `scripts/fix-env.sh` 里有处理,补丁打在 build 产物目录,不影响 SDK 源码和镜像内容。
+另外，老 buildroot(2020.02) 在新宿主系统上编译可能遇到 m4/fakeroot/cmake/scons 的版本兼容问题 (glibc 接口变更、cmake 4 移除旧版本兼容等)。SDK 的 `scripts/fix-env.sh` 里有处理，补丁打在 build 产物目录，不影响 SDK 源码和镜像内容。
 
-## 8. 总结:为什么改
+## 8. 总结：为什么改
 
 | 改动类型                       | 数量   | 作用                             |
 | -------------------------- | ---- | ------------------------------ |
-| 原地修改(board.c / PUFS / PTE) | 3 处  | 修掉 QEMU 与真机环境的差异(启动介质、安全硬件、页表) |
-| 顶层 defconfig 派生(5 个开关)     | 1 文件 | 把官方构建流程"指向"QEMU 板级             |
-| 板级派生(dts/defconfig)        | 3 文件 | QEMU 板级的静态描述                   |
+| 原地修改 (board.c / PUFS / PTE) | 3 处  | 修掉 QEMU 与真机环境的差异 (启动介质、安全硬件、页表) |
+| 顶层 defconfig 派生 (5 个开关)     | 1 文件 | 把官方构建流程"指向"QEMU 板级             |
+| 板级派生 (dts/defconfig)        | 3 文件 | QEMU 板级的静态描述                   |
 
-其余都是 SDK 官方流程自己完成的:Linux 编译、buildroot、U-Boot 编译、genimage 装配。开关给对,官方流程就能干活。
+其余都是 SDK 官方流程自己完成的:Linux 编译、buildroot、U-Boot 编译、genimage 装配。开关给对，官方流程就能干活。
 
 ## 9. 直接复现:k230-boot-test 仓库
 
-全部改动和产物在 [k230-boot-test](https://github.com/flamboyante/k230-boot-test) 仓库:
+全部改动和产物在 [k230-boot-test](https://github.com/flamboyante/k230-boot-test) 仓库：
 
 ```text
-artifacts/   预构建镜像(JFFS2 + UBI 两个变体)+ rootfs + SPL/U-Boot/env + SHA256SUMS
-docs/        实验文档(从零、含完整复现步骤)
-scripts/     宿主环境探测/修复脚本(check-env.sh / fix-env.sh)
-locks/       SDK 与 QEMU 的增量 bundle + 基线锁定(sources.lock)
+artifacts/   预构建镜像 (JFFS2 + UBI 两个变体)+ rootfs + SPL/U-Boot/env + SHA256SUMS
+docs/        实验文档 (从零、含完整复现步骤)
+scripts/     宿主环境探测/修复脚本 (check-env.sh / fix-env.sh)
+locks/       SDK 与 QEMU 的增量 bundle + 基线锁定 (sources.lock)
 ```
 
-clone 即跑:
+clone 即跑：
 
 ```bash
 git clone https://github.com/flamboyante/k230-boot-test.git
@@ -334,7 +334,7 @@ SD 卡启动尚未验证，后续会单独处理。它会复用启动链的整�
 
 \[3] QEMU. <https://gitlab.com/qemu-project/qemu>
 
-\[4] k230-boot-test 仓库(冷启动复现 harness,含预构建产物与增量 bundle).
+\[4] k230-boot-test 仓库 (冷启动复现 harness，含预构建产物与增量 bundle).
 <https://github.com/flamboyante/k230-boot-test>
 
-\[5] QEMU Camp 训练营仓库. <https://github.com/gevico/qemu-camp-tutorial>
+\[5] QEMU Camp 训练营仓库。<https://github.com/gevico/qemu-camp-tutorial>

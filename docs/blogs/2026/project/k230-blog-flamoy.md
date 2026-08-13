@@ -36,7 +36,7 @@ K230 是 Canaan 的 AIoT SoC，包含两个 RISC-V 计算核和一个 KPU。项�
 
 到了 QEMU 外设建模，视角正好反过来：模型成了 IP 的内部实现。驱动写的每一笔配置、读到的每一个状态、等待的每一次中断，都必须由代码给出符合预期的行为。
 
-### 1.2 任务： issue
+### 1.2 任务：issue
 
 训练营仓库里的 K230 issue 正好对应这批占位设备。目标是逐步将它们替换成有实际行为的模型，满足 SDK 中 U-Boot 和 Linux 驱动的最小功能契约。
 
@@ -257,7 +257,7 @@ else
     priv->tmode = CTRLR0_TMOD_TO;              // 写操作 -> TO
 ```
 
-单线读（包括 Read ID、Read Data、Read SFDP）全部走 EEPROM\_READ，NDF 设为 `data.nbytes - 1`，写完命令+地址+dummy 后调 `poll_transfer()` 轮询 RXFLR 收数据。所以传输泵必须实现 EEPROM\_READ 的两阶段状态机：先把 TX FIFO 里的命令/地址发完，然后自动发 `NDF+1` 帧 0x00 产生时钟，把 RX 数据收回来。RO 同理，只是命令阶段只有一个 dummy 帧。
+单线读（包括 Read ID、Read Data、Read SFDP）全部走 EEPROM\_READ，NDF 设为 `data.nbytes - 1`，写完命令 + 地址+dummy 后调 `poll_transfer()` 轮询 RXFLR 收数据。所以传输泵必须实现 EEPROM\_READ 的两阶段状态机：先把 TX FIFO 里的命令/地址发完，然后自动发 `NDF+1` 帧 0x00 产生时钟，把 RX 数据收回来。RO 同理，只是命令阶段只有一个 dummy 帧。
 
 ### 3.3 挂 Flash：num-cs 的 SDK 内部不一致
 
@@ -270,7 +270,7 @@ Flash 挂接本身只需将 spi0 的 CS0 连接到 m25p80（SPI NOR Flash 模型
 
 ### 3.4 IRQ：动态水位中断
 
-K230 DW SSI 共有 9 路中断接到 PLIC：TXE（TX FIFO 空）、RXF（RX FIFO 满/达阈值）、RXO（RX 溢出）、TXU（TX 欠载）、RXU（RX 欠载）、MST（多主机冲突）、DONE（传输完成）、AXIE（AXI/IDMA 错误）加一个总清。其实还有ssi ip理论还有不少其他的中断，不过鉴于k230只支持9路，于是我就按9路实现了。
+K230 DW SSI 共有 9 路中断接到 PLIC：TXE（TX FIFO 空）、RXF（RX FIFO 满/达阈值）、RXO（RX 溢出）、TXU（TX 欠载）、RXU（RX 欠载）、MST（多主机冲突）、DONE（传输完成）、AXIE（AXI/IDMA 错误）加一个总清。其实还有 ssi ip 理论还有不少其他的中断，不过鉴于 k230 只支持 9 路，于是我就按 9 路实现了。
 
 中断这块返过一次工。TXE 和 RXF 是水位中断：TXE 表示 TX FIFO 里的数据量低于或等于阈值（TFT），可以继续喂数据；RXF 表示 RX FIFO 里的数据量超过阈值（RFT），需要读走。这两个中断**不能用缓存值**——每次中断状态计算时，都必须从 FIFO 实时读取当前深度，和阈值寄存器比较，现算出来：
 
@@ -311,7 +311,7 @@ dw_write(priv, DW_SPI_SSIENR, 0);          /* 先禁用控制器 */
 dw_write(priv, DW_SPI_CTRLR0, cr0);        /* 设帧格式、TMOD、时钟极性等 */
 dw_write(priv, DW_SPI_BAUDR, clk_div);     /* 设波特率分频 */
 dw_write(priv, DW_SPI_TXFTLR, 0);          /* TX 阈值设 0 */
-dw_write(priv, DW_SPI_RXFTLR, fifo_len-1); /* RX 阈值设 FIFO 深度-1 */
+dw_write(priv, DW_SPI_RXFTLR, fifo_len-1); /* RX 阈值设 FIFO 深度 -1 */
 dw_write(priv, DW_SPI_SER, 1 << cs);       /* 片选 */
 dw_write(priv, DW_SSI_SSIENR, 1);          /* 启用控制器 */
 ```
@@ -515,17 +515,17 @@ V1 后期，Bin Meng 在 patch 1 上给了一个反馈：**把模型拆成两层
 2. **U-Boot 的** **`designware_spi.c`** **本来就是通用 driver**：文件头注释写着 Denx 维护，Copyright Stefan Roese / Sean Anderson，基于 Linux `drivers/spi/spi-dw.c`。K230 SDK 只在顶部改了一行 `#define SSIC_HAS_DMA 2`——说明软件侧早就是按通用 IP 写的驱动。
 3. **QEMU 已有先例**：`hw/i2c/designware_i2c.c` 就是 Synopsys DW I2C 的通用模型，`TYPE_DESIGNWARE_I2C`，没挂任何 SoC wrapper——通用层加属性就够了。
 
-这三条证据说明，继续按 K230 私有设备维护并不合适。于是我就开始了V2版本的改良
+这三条证据说明，继续按 K230 私有设备维护并不合适。于是我就开始了 V2 版本的改良
 
 ## 7. V2/V3：拆成通用模型
 
 ### 7.1 拆分
 
-V2主要改动有三项：
+V2 主要改动有三项：
 
 - **实例差异全部属性化**：通用模型 `TYPE_DW_SSI`（后来 V3 改名 `TYPE_DWC_SSI`）不再引用任何 K230 概念，实例差异全部走 `DwSsiConfig` 属性（num-cs、fifo-depth、imr-reset）。想复用就传参数，别的 SoC 用同一个模型只需要填不同的配置。
 - **去掉 HI\_SYS 反向指针**：V1 里 SSI 反向持有 K230 的指针去问 HI\_SYS 状态。V2 改成 GPIO `xip-enable` input——HI\_SYS 作为外部信号驱动这个 GPIO，通用层对 K230 一无所知。
-- 鉴于V1出来的3000+行代码，上游review压力也很恐怖，所以我再V2特地做了改良，只筛选了第一层次的standard spi，这样技能支持dw ssi模型，又不影响整个k230的启动路径，也算个不错的抉择。
+- 鉴于 V1 出来的 3000+ 行代码，上游 review 压力也很恐怖，所以我再 V2 特地做了改良，只筛选了第一层次的 standard spi，这样技能支持 dw ssi 模型，又不影响整个 k230 的启动路径，也算个不错的抉择。
 
 按照 patch 1 先建立可编译、可测试的通用控制器，patch 2 增加中断，patch 3\~5 才处理 K230 实例、中断路由和 Flash 挂接。前两项不含 K230 集成逻辑。
 
@@ -549,7 +549,7 @@ V2 发送后，趁着还没得评审的时候，我自己按寄存器语义重�
 还有几个边界划分的决定：
 
 - 九路 IRQ 拓扑保留，但 Standard-only 下 DONE/AXIE 恒低、clear 寄存器 RAZ/WI；
-- `SPI_FRF` 没单独放开 writable mask，这个会影响linux启动的状态查询
+- `SPI_FRF` 没单独放开 writable mask，这个会影响 linux 启动的状态查询
 
 ## 8. 回头看：几条工作方法
 
